@@ -1,17 +1,13 @@
-import anthropic
 import json
 from typing import List
-from app.config import ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_KEY
+from app.config import SUPABASE_URL, SUPABASE_KEY
 from supabase import create_client
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def get_embedding(text: str) -> List[float]:
-    """用 Voyage AI（Anthropic 的 embedding）產生向量"""
-    response = client.beta.messages.batches  # placeholder
-    # 暫時用簡單的 hash-based mock，之後換 voyage-ai
+    """Hash-based mock embedding（之後可換真實 embedding API）"""
     import hashlib
     h = hashlib.md5(text.encode()).hexdigest()
     # 產生 1536 維的假向量（之後換真實 embedding）
