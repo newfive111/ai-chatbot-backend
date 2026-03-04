@@ -1,11 +1,11 @@
 import io
-import PyPDF2
+from pypdf import PdfReader
 from typing import List
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     """從 PDF 提取文字"""
-    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+    reader = PdfReader(io.BytesIO(file_bytes))
     text = ""
     for page in reader.pages:
         text += page.extract_text() + "\n"
