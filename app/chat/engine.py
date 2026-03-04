@@ -112,6 +112,17 @@ def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> 
 # DATA_SAVE 偵測
 # ──────────────────────────────────────
 
+def _get_display_name(data: dict) -> str:
+    """從收集資料中找姓名欄位，作為 Sheet 第一欄的顯示名稱"""
+    name_keywords = ["姓名", "名字", "稱呼", "姓", "name"]
+    for key in data:
+        if any(kw in key for kw in name_keywords):
+            val = str(data[key]).strip()
+            if val:
+                return val
+    return None
+
+
 def _extract_and_save_data(raw_reply: str, sheet_id: str, session_id: str) -> Tuple[str, bool]:
     """
     偵測 Claude 回覆中的 DATA_SAVE: {...}，寫入 Google Sheet。
@@ -128,7 +139,8 @@ def _extract_and_save_data(raw_reply: str, sheet_id: str, session_id: str) -> Tu
         fields = list(data.keys())
         try:
             from app.sheets.client import upsert_row
-            upsert_row(sheet_id, session_id, fields, data)
+            display_name = _get_display_name(data)
+            upsert_row(sheet_id, session_id, fields, data, display_name=display_name)
             logging.info(f"[Sheet] DATA_SAVE written session={session_id[:8]} fields={fields}")
         except Exception as e:
             logging.warning(f"[Sheet] DATA_SAVE write failed: {e}")
@@ -248,7 +260,8 @@ def generate_answer(
 
                 try:
                     from app.sheets.client import upsert_row
-                    upsert_row(sheet_id, session_id, fields, collected)
+                    display_name = _get_display_name(collected)
+                    upsert_row(sheet_id, session_id, fields, collected, display_name=display_name)
                 except Exception as e:
                     logging.warning(f"[Sheet] incremental save failed: {e}")
 

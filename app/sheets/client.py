@@ -47,29 +47,37 @@ def ensure_headers(sheet, fields: List[str], with_session_id: bool = False):
         sheet.update("A1", [all_fields])
 
 
-def upsert_row(sheet_id: str, session_id: str, fields: List[str], data: Dict[str, str]):
+def upsert_row(sheet_id: str, session_id: str, fields: List[str], data: Dict[str, str], display_name: str = None):
     """
     Incremental save：每收到一個欄位就即時更新。
-    - 用 session_id 找到已有的行 → 更新它
+    - display_name: 有姓名欄位時顯示名稱（如「陳大明」），否則顯示 session_id
+    - 用 session_id 或 display_name 找到已有的行 → 更新它
     - 找不到 → 新增一行
-    這樣不會因用戶中途離開或 server 重啟而漏資料。
     """
     sheet = get_sheet(sheet_id)
     ensure_headers(sheet, fields, with_session_id=True)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    row_data = [session_id] + [data.get(f, "") for f in fields] + [now]
+    display_key = display_name if display_name else session_id
+    row_data = [display_key] + [data.get(f, "") for f in fields] + [now]
 
-    # 搜尋第一欄（session_id）找是否已有這個 session 的行
-    col_a = sheet.col_values(1)  # [header, sid1, sid2, ...]
-    try:
-        row_index = col_a.index(session_id) + 1  # 1-based
+    # 搜尋第一欄找已有的行（先找 display_name，再找 session_id）
+    col_a = sheet.col_values(1)  # [header, name1, name2, ...]
+    row_index = None
+
+    # 先找 display_key（名字或 session_id）
+    if display_key in col_a:
+        row_index = col_a.index(display_key) + 1
+    # 若 display_name 存在但 col_a 還存著舊的 session_id → 找並更新
+    elif display_name and session_id in col_a:
+        row_index = col_a.index(session_id) + 1
+
+    if row_index:
         sheet.update(f"A{row_index}", [row_data])
-        logging.info(f"[Sheet] updated row {row_index} for session {session_id[:8]}")
-    except ValueError:
-        # 找不到 → 新增
+        logging.info(f"[Sheet] updated row {row_index} → {display_key}")
+    else:
         sheet.append_row(row_data)
-        logging.info(f"[Sheet] new row for session {session_id[:8]}")
+        logging.info(f"[Sheet] new row → {display_key}")
 
 
 def append_row(sheet_id: str, fields: List[str], data: Dict[str, str]):
