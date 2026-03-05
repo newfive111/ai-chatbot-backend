@@ -466,6 +466,34 @@ async def line_webhook(bot_id: str, request: Request):
 
 
 # ──────────────────────────────────────
+# Layer 2 AI 設定助手
+# ──────────────────────────────────────
+
+class AssistantRequest(BaseModel):
+    bot_id: str
+    message: str
+    session_id: Optional[str] = None
+
+@app.post("/assistant/chat")
+async def assistant_chat(
+    body: AssistantRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """AI 設定助手：用 Gemini Function Calling 幫用戶直接操作 Bot 設定"""
+    user_id = get_user_id(authorization)
+    # 驗證 bot 屬於該用戶，並取 API Key
+    r = supabase.table("bots").select("anthropic_api_key").eq("id", body.bot_id).eq("user_id", user_id).execute()
+    if not r.data:
+        raise HTTPException(404, "Bot 不存在")
+    api_key = r.data[0].get("anthropic_api_key")
+    session_id = body.session_id or f"assistant_{user_id}_{body.bot_id}"
+
+    from app.assistant.engine import run_assistant
+    reply = run_assistant(body.bot_id, body.message, session_id, api_key)
+    return {"reply": reply}
+
+
+# ──────────────────────────────────────
 # 對話記錄查詢
 # ──────────────────────────────────────
 
