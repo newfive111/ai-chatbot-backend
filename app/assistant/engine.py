@@ -34,6 +34,13 @@ ASSISTANT_SYSTEM_PROMPT = """
 - LINE Bot 串接：在「🔗 嵌入代碼」→「LINE Bot 串接」，按照頁面步驟填入 Channel Secret 和 Access Token
 - Gemini API Key：在「⚙️ 設定」→「Gemini API Key」，從 Google AI Studio 取得後填入
 - 知識庫：在「📚 知識庫」tab，上傳 PDF/TXT 或手動輸入 FAQ
+- 預約系統（Google Calendar 串接）：在「⚙️ 設定」→「📅 預約系統」，步驟如下：
+  1. 到 Google Calendar 建立一個專用行事曆（例如「預約系統」）
+  2. 把行事曆共用給服務帳號 bothelper-sheets@bothelper-489007.iam.gserviceaccount.com（設為「更改事件」）
+  3. 在行事曆設定的「整合行事曆」找到 Calendar ID（格式：xxx@group.calendar.google.com）
+  4. 在後台「預約系統」填入 Calendar ID、設定每次時長和上班時間
+  5. 儲存後，Bot 就能自動查詢空檔、讓客人選時間並直接建立行事曆事件
+  注意：預約功能啟用後，Bot 的角色設定必須存在（在「🤖 角色」tab 設定），否則預約邏輯不會生效
 
 【操作原則】
 - 修改設定前：先告知用戶打算做什麼，獲確認後才呼叫工具
