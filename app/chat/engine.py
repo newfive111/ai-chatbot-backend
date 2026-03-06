@@ -58,26 +58,47 @@ PLATFORM_RULES = """
 「好的，資料都登記完成了！請您稍等一下，我現在把資料轉給主管確認，待會由專員直接回覆您。」"""
 
 
+CALENDAR_BOOKING_RULES = """
+
+---【預約系統規則】---
+你具備查詢空檔和建立預約的能力。
+
+【預約流程】
+1. 客人說想預約時，先問「請問您希望哪天預約？」
+2. 客人說出日期後，立刻呼叫 check_availability 工具查詢
+3. 告知客人當天可選的時段，例如「今天還有 10:00、14:00、16:00 可以預約」
+4. 客人選好時段後，詢問：姓名、電話、服務項目（若還沒有）
+5. 全部確認後，呼叫 book_appointment 完成預約
+6. 回覆「✅ 預約成功！[日期] [時間] 已為您登記，期待您的光臨！」
+
+【注意事項】
+- 不要自己猜測有沒有空，一定要呼叫工具確認
+- 若當天無空位，主動說「那天已滿，要不要看看其他日期？」
+- 客人說「明天」「下週一」等，請換算成正確的 YYYY-MM-DD 格式"""
+
+
 def _get_system_prompt(
     bot_name: str,
     context: str,
     custom_system_prompt: Optional[str] = None,
-    has_sheet: bool = False
+    has_sheet: bool = False,
+    has_calendar: bool = False
 ) -> str:
     """
-    組合最終 system prompt：[角色設定] + [知識庫] + [平台底層規則]
-    平台規則永遠注入，不受客戶自訂 prompt 影響。
+    組合最終 system prompt：[角色設定] + [知識庫] + [預約規則?] + [平台底層規則]
     """
     role_section = custom_system_prompt.strip() if (custom_system_prompt and custom_system_prompt.strip()) \
                    else DEFAULT_ROLE_PROMPT.format(bot_name=bot_name)
 
     kb_section = f"\n\n【知識庫參考資料】\n{context}" if context else ""
 
+    calendar_section = CALENDAR_BOOKING_RULES if has_calendar else ""
+
     rules = PLATFORM_RULES
     if not has_sheet:
         rules = rules.split("【DATA_SAVE 完成交接語】")[0].rstrip()
 
-    return f"{role_section}{kb_section}{rules}"
+    return f"{role_section}{kb_section}{calendar_section}{rules}"
 
 
 # ──────────────────────────────────────
@@ -85,18 +106,16 @@ def _get_system_prompt(
 # ──────────────────────────────────────
 
 def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> str:
-    """呼叫 Gemini 2.5 Flash"""
+    """呼叫 Gemini 2.5 Flash（無工具版）"""
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
 
-    # 把 {role: user/assistant} 格式轉成 Gemini 的 {role: user/model}
     contents = []
     for msg in history:
         role = "user" if msg["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
-
     contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
 
     response = client.models.generate_content(
@@ -108,6 +127,128 @@ def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> 
         ),
     )
     return response.text
+
+
+def _call_ai_with_calendar(
+    api_key: str,
+    system_prompt: str,
+    history: list,
+    question: str,
+    calendar_id: str,
+    slot_duration: int,
+    business_hours: dict
+) -> str:
+    """呼叫 Gemini 2.5 Flash（含預約 Function Calling）"""
+    from google import genai
+    from google.genai import types
+    from datetime import date as _date
+
+    client = genai.Client(api_key=api_key)
+
+    tools = types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name="check_availability",
+            description="查詢指定日期的可預約時段，詢問客人想預約哪天後立刻呼叫此工具",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "date": types.Schema(
+                        type=types.Type.STRING,
+                        description=f"日期，格式 YYYY-MM-DD，今天是 {_date.today().isoformat()}"
+                    )
+                },
+                required=["date"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="book_appointment",
+            description="確認預約，在行事曆建立事件。客人確認日期、時間、姓名、電話後呼叫",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "date":            types.Schema(type=types.Type.STRING, description="日期 YYYY-MM-DD"),
+                    "time":            types.Schema(type=types.Type.STRING, description="時間 HH:MM"),
+                    "customer_name":   types.Schema(type=types.Type.STRING, description="客人姓名"),
+                    "customer_phone":  types.Schema(type=types.Type.STRING, description="客人電話"),
+                    "service":         types.Schema(type=types.Type.STRING, description="服務項目，例如：剪髮、染髮"),
+                },
+                required=["date", "time", "customer_name", "customer_phone"]
+            )
+        )
+    ])
+
+    contents = []
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
+    contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
+
+    for _ in range(6):
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=[tools],
+                max_output_tokens=1024,
+            )
+        )
+        candidate = response.candidates[0]
+        contents.append(candidate.content)
+
+        fc_parts = [p for p in candidate.content.parts if p.function_call]
+        if not fc_parts:
+            # 最終文字回覆
+            return "".join(
+                p.text for p in candidate.content.parts if hasattr(p, "text") and p.text
+            ).strip() or "處理完成"
+
+        # 執行工具
+        tool_response_parts = []
+        for p in fc_parts:
+            fc   = p.function_call
+            args = dict(fc.args) if fc.args else {}
+
+            try:
+                if fc.name == "check_availability":
+                    from app.calendar.client import get_available_slots
+                    slots = get_available_slots(
+                        calendar_id, args["date"], slot_duration, business_hours
+                    )
+                    if slots:
+                        result = f"{args['date']} 可預約時段：{', '.join(slots)}"
+                    else:
+                        result = f"{args['date']} 當天沒有可預約的時段（休假或已全滿）"
+
+                elif fc.name == "book_appointment":
+                    from app.calendar.client import create_booking
+                    svc   = args.get("service", "預約")
+                    name  = args.get("customer_name", "客人")
+                    phone = args.get("customer_phone", "")
+                    title = f"{name} - {svc}"
+                    desc  = f"姓名：{name}\n電話：{phone}\n服務：{svc}"
+                    data  = create_booking(
+                        calendar_id, title, args["date"], args["time"], slot_duration, desc
+                    )
+                    result = f"預約成功！{args['date']} {args['time']}，{name} 的 {svc} 已登記。"
+                else:
+                    result = "未知工具"
+
+            except Exception as e:
+                result = f"操作失敗：{str(e)[:80]}"
+
+            logging.info(f"[Calendar] {fc.name} → {result[:80]}")
+            tool_response_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name=fc.name, response={"result": result}
+                    )
+                )
+            )
+
+        contents.append(types.Content(role="tool", parts=tool_response_parts))
+
+    return "處理超時，請再試一次。"
 
 
 # ──────────────────────────────────────
@@ -167,35 +308,44 @@ def generate_answer(
     session_id: Optional[str] = None,
     custom_system_prompt: Optional[str] = None,
     handoff_reply: Optional[str] = None,
+    # 預約系統
+    calendar_id: Optional[str] = None,
+    slot_duration_minutes: int = 60,
+    business_hours: Optional[dict] = None,
 ) -> str:
-    # 強制使用客戶自己的 Key，不 fallback 到平台 Key
-    # 平台費用不代墊，客戶必須 BYOK
     if not api_key:
         raise Exception("NO_API_KEY")
 
     relevant_chunks = search_similar_chunks(bot_id, question, top_k=5)
     context = "\n\n".join(relevant_chunks)
+    has_calendar = bool(calendar_id)
     system_prompt = _get_system_prompt(
         bot_name, context, custom_system_prompt,
-        has_sheet=bool(sheet_id)
+        has_sheet=bool(sheet_id),
+        has_calendar=has_calendar
     )
+    _bh = business_hours or {"start": "09:00", "end": "18:00", "weekdays": [1, 2, 3, 4, 5]}
 
-    # ── 路徑 A：有自訂 prompt → Claude 全程主導 ──
+    # ── 路徑 A：有自訂 prompt → LLM 全程主導（含 calendar 支援）──
     if custom_system_prompt and custom_system_prompt.strip():
         if session_id:
             session = session_store.get_or_create(session_id)
-
-            # 🔇 已交接 → 回等待語，不打 Claude
             if session.get("status") == "handed_off":
                 logging.info(f"[Engine] {session_id[:8]} handed_off → holding reply")
                 return handoff_reply or HANDOFF_REPLY
-
             history = session.get("history", [])
         else:
             session = None
             history = []
 
-        raw_reply = _call_ai(api_key, system_prompt, history, question)
+        # 有 calendar_id → 使用 Function Calling 版本
+        if has_calendar:
+            raw_reply = _call_ai_with_calendar(
+                api_key, system_prompt, history, question,
+                calendar_id, slot_duration_minutes, _bh
+            )
+        else:
+            raw_reply = _call_ai(api_key, system_prompt, history, question)
 
         if sheet_id and session_id:
             clean_reply, data_saved = _extract_and_save_data(raw_reply, sheet_id, session_id)
@@ -204,7 +354,6 @@ def generate_answer(
                 logging.info(f"[Engine] {session_id[:8]} → handed_off (DATA_SAVE)")
         else:
             clean_reply = re.sub(r'\n?DATA_SAVE:\s*\{.*?\}\n?', '', raw_reply, flags=re.DOTALL).strip()
-            data_saved = False
 
         if session_id and session is not None:
             session["history"] = history + [

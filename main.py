@@ -150,6 +150,10 @@ class UpdateBotRequest(BaseModel):
     quick_replies: Optional[list] = None
     line_channel_secret: Optional[str] = None
     line_channel_access_token: Optional[str] = None
+    # 預約系統
+    calendar_id: Optional[str] = None
+    slot_duration_minutes: Optional[int] = None
+    business_hours: Optional[dict] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -283,7 +287,8 @@ class ChatRequest(BaseModel):
 @app.post("/bots/{bot_id}/chat")
 async def chat(bot_id: str, body: ChatRequest):
     result = supabase.table("bots").select(
-        "name, anthropic_api_key, sheet_id, collect_fields, system_prompt"
+        "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, "
+        "calendar_id, slot_duration_minutes, business_hours"
     ).eq("id", bot_id).execute()
     bot_data = result.data[0] if result.data else {}
     bot_name = bot_data.get("name", "AI 助理")
@@ -291,6 +296,9 @@ async def chat(bot_id: str, body: ChatRequest):
     sheet_id = bot_data.get("sheet_id")
     collect_fields = bot_data.get("collect_fields") or []
     system_prompt = bot_data.get("system_prompt") or None
+    calendar_id = bot_data.get("calendar_id") or None
+    slot_duration = bot_data.get("slot_duration_minutes") or 60
+    business_hours = bot_data.get("business_hours") or None
 
     try:
         answer = generate_answer(
@@ -299,7 +307,10 @@ async def chat(bot_id: str, body: ChatRequest):
             collect_fields=collect_fields if collect_fields else None,
             sheet_id=sheet_id,
             session_id=body.session_id,
-            custom_system_prompt=system_prompt
+            custom_system_prompt=system_prompt,
+            calendar_id=calendar_id,
+            slot_duration_minutes=slot_duration,
+            business_hours=business_hours,
         )
     except Exception as e:
         if "NO_API_KEY" in str(e):
@@ -323,7 +334,8 @@ def _get_bot_config(bot_id: str) -> dict:
     """從 Supabase 取得完整 bot 設定"""
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, "
-        "line_channel_secret, line_channel_access_token"
+        "line_channel_secret, line_channel_access_token, "
+        "calendar_id, slot_duration_minutes, business_hours"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
@@ -348,7 +360,10 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str):
         sheet_id  = bot.get("sheet_id")
         collect_fields = bot.get("collect_fields") or []
         system_prompt  = bot.get("system_prompt") or None
-        line_token     = bot.get("line_channel_access_token")  # bot 專屬 Token
+        line_token     = bot.get("line_channel_access_token")
+        calendar_id    = bot.get("calendar_id") or None
+        slot_duration  = bot.get("slot_duration_minutes") or 60
+        business_hours = bot.get("business_hours") or None
 
         try:
             answer = generate_answer(
@@ -357,7 +372,10 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str):
                 collect_fields=collect_fields if collect_fields else None,
                 sheet_id=sheet_id,
                 session_id=session_id,
-                custom_system_prompt=system_prompt
+                custom_system_prompt=system_prompt,
+                calendar_id=calendar_id,
+                slot_duration_minutes=slot_duration,
+                business_hours=business_hours,
             )
         except Exception as e:
             if "NO_API_KEY" in str(e):
