@@ -312,9 +312,20 @@ def generate_answer(
     calendar_id: Optional[str] = None,
     slot_duration_minutes: int = 60,
     business_hours: Optional[dict] = None,
+    # 關鍵字觸發
+    keyword_triggers: Optional[list] = None,
 ) -> str:
     if not api_key:
         raise Exception("NO_API_KEY")
+
+    # ── 關鍵字觸發（最高優先，不耗 token）──
+    if keyword_triggers:
+        q_lower = question.lower()
+        for kt in keyword_triggers:
+            kw = kt.get("keyword", "").lower()
+            if kw and kw in q_lower:
+                logging.info(f"[Engine] Keyword match: '{kw}'")
+                return kt.get("reply", "")
 
     relevant_chunks = search_similar_chunks(bot_id, question, top_k=5)
     context = "\n\n".join(relevant_chunks)

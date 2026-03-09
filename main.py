@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Set, Dict
+from datetime import datetime, timedelta
 import json
 import uuid
 import asyncio
@@ -154,6 +155,8 @@ class UpdateBotRequest(BaseModel):
     calendar_id: Optional[str] = None
     slot_duration_minutes: Optional[int] = None
     business_hours: Optional[dict] = None
+    # 關鍵字觸發
+    keyword_triggers: Optional[list] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -166,7 +169,7 @@ async def update_bot(
     for k, v in body.model_dump().items():
         if v is not None:
             update_data[k] = v
-        elif k in ("collect_fields", "quick_replies"):
+        elif k in ("collect_fields", "quick_replies", "keyword_triggers"):
             # 允許儲存空 list
             update_data[k] = []
         elif k in ("system_prompt", "welcome_message") and v == "":
@@ -288,7 +291,7 @@ class ChatRequest(BaseModel):
 async def chat(bot_id: str, body: ChatRequest):
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, "
-        "calendar_id, slot_duration_minutes, business_hours"
+        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers"
     ).eq("id", bot_id).execute()
     bot_data = result.data[0] if result.data else {}
     bot_name = bot_data.get("name", "AI 助理")
@@ -299,6 +302,7 @@ async def chat(bot_id: str, body: ChatRequest):
     calendar_id = bot_data.get("calendar_id") or None
     slot_duration = bot_data.get("slot_duration_minutes") or 60
     business_hours = bot_data.get("business_hours") or None
+    keyword_triggers = bot_data.get("keyword_triggers") or None
 
     try:
         answer = generate_answer(
@@ -311,6 +315,7 @@ async def chat(bot_id: str, body: ChatRequest):
             calendar_id=calendar_id,
             slot_duration_minutes=slot_duration,
             business_hours=business_hours,
+            keyword_triggers=keyword_triggers,
         )
     except Exception as e:
         if "NO_API_KEY" in str(e):
@@ -335,7 +340,7 @@ def _get_bot_config(bot_id: str) -> dict:
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, "
         "line_channel_secret, line_channel_access_token, "
-        "calendar_id, slot_duration_minutes, business_hours"
+        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
@@ -364,6 +369,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str):
         calendar_id    = bot.get("calendar_id") or None
         slot_duration  = bot.get("slot_duration_minutes") or 60
         business_hours = bot.get("business_hours") or None
+        keyword_triggers = bot.get("keyword_triggers") or None
 
         try:
             answer = generate_answer(
@@ -376,6 +382,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str):
                 calendar_id=calendar_id,
                 slot_duration_minutes=slot_duration,
                 business_hours=business_hours,
+                keyword_triggers=keyword_triggers,
             )
         except Exception as e:
             if "NO_API_KEY" in str(e):
@@ -514,6 +521,48 @@ async def assistant_chat(
 # ──────────────────────────────────────
 # 對話記錄查詢
 # ──────────────────────────────────────
+
+@app.get("/bots/{bot_id}/analytics")
+async def get_bot_analytics(
+    bot_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    """Bot 數據分析：總對話數、今日、本週、7天趨勢、最近問題"""
+    user_id = get_user_id(authorization)
+    bot = supabase.table("bots").select("id").eq("id", bot_id).eq("user_id", user_id).execute()
+    if not bot.data:
+        raise HTTPException(404, "Bot 不存在")
+
+    now = datetime.utcnow()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    week_start = (now - timedelta(days=7)).isoformat()
+
+    total_r = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).execute()
+    today_r = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).gte("created_at", today_start).execute()
+    week_r  = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).gte("created_at", week_start).execute()
+
+    # 7 天每日分佈
+    rows = supabase.table("conversations").select("created_at").eq("bot_id", bot_id).gte("created_at", week_start).execute()
+    daily: dict = {}
+    for row in (rows.data or []):
+        day = row["created_at"][:10]
+        daily[day] = daily.get(day, 0) + 1
+    daily_counts = []
+    for i in range(6, -1, -1):
+        d = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        daily_counts.append({"date": d, "count": daily.get(d, 0)})
+
+    # 最近 20 筆問題
+    recent = supabase.table("conversations").select("question, created_at").eq("bot_id", bot_id).order("created_at", desc=True).limit(20).execute()
+
+    return {
+        "total":            total_r.count or 0,
+        "today":            today_r.count or 0,
+        "this_week":        week_r.count or 0,
+        "daily_counts":     daily_counts,
+        "recent_questions": [r["question"] for r in (recent.data or [])]
+    }
+
 
 @app.get("/bots/{bot_id}/conversations")
 async def get_conversations(
