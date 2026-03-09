@@ -527,40 +527,83 @@ async def get_bot_analytics(
     bot_id: str,
     authorization: Optional[str] = Header(None)
 ):
-    """Bot 數據分析：總對話數、今日、本週、7天趨勢、最近問題"""
+    """Bot 數據分析：總對話數、今日、本週、7天趨勢、熱門問題、峰值時段、週成長率"""
     user_id = get_user_id(authorization)
     bot = supabase.table("bots").select("id").eq("id", bot_id).eq("user_id", user_id).execute()
     if not bot.data:
         raise HTTPException(404, "Bot 不存在")
 
     now = datetime.utcnow()
+    # 時區偏移（台灣 UTC+8）
+    tw_offset = timedelta(hours=8)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    week_start = (now - timedelta(days=7)).isoformat()
+    week_start      = (now - timedelta(days=7)).isoformat()
+    prev_week_start = (now - timedelta(days=14)).isoformat()
 
     total_r = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).execute()
     today_r = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).gte("created_at", today_start).execute()
     week_r  = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).gte("created_at", week_start).execute()
+    prev_week_r = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).gte("created_at", prev_week_start).lt("created_at", week_start).execute()
 
-    # 7 天每日分佈
+    # 週成長率
+    this_week_count = week_r.count or 0
+    prev_week_count = prev_week_r.count or 0
+    if prev_week_count > 0:
+        week_growth = round((this_week_count - prev_week_count) / prev_week_count * 100, 1)
+    elif this_week_count > 0:
+        week_growth = 100.0
+    else:
+        week_growth = 0.0
+
+    # 7 天每日分佈（台灣時間）
     rows = supabase.table("conversations").select("created_at").eq("bot_id", bot_id).gte("created_at", week_start).execute()
     daily: dict = {}
+    hourly: dict = {}
     for row in (rows.data or []):
-        day = row["created_at"][:10]
+        ts = row["created_at"]
+        # 轉台灣時間
+        from datetime import timezone
+        try:
+            dt_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            dt_tw = dt_utc + tw_offset
+            day = dt_tw.strftime("%Y-%m-%d")
+            hour = dt_tw.hour
+        except Exception:
+            day = ts[:10]
+            hour = int(ts[11:13]) if len(ts) > 12 else 0
         daily[day] = daily.get(day, 0) + 1
+        hourly[hour] = hourly.get(hour, 0) + 1
+
     daily_counts = []
     for i in range(6, -1, -1):
-        d = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        d = ((now + tw_offset) - timedelta(days=i)).strftime("%Y-%m-%d")
         daily_counts.append({"date": d, "count": daily.get(d, 0)})
 
-    # 最近 20 筆問題
-    recent = supabase.table("conversations").select("question, created_at").eq("bot_id", bot_id).order("created_at", desc=True).limit(20).execute()
+    # 24 小時分佈
+    hourly_distribution = [{"hour": h, "count": hourly.get(h, 0)} for h in range(24)]
+
+    # 熱門問題（最近 200 筆，計算重複次數，取 top 10）
+    all_q = supabase.table("conversations").select("question").eq("bot_id", bot_id).order("created_at", desc=True).limit(200).execute()
+    q_counter: dict = {}
+    for row in (all_q.data or []):
+        q = row["question"].strip()
+        q_counter[q] = q_counter.get(q, 0) + 1
+    top_questions = sorted(q_counter.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_questions = [{"question": q, "count": c} for q, c in top_questions]
+
+    # 最近 10 筆問題
+    recent = supabase.table("conversations").select("question, created_at").eq("bot_id", bot_id).order("created_at", desc=True).limit(10).execute()
 
     return {
-        "total":            total_r.count or 0,
-        "today":            today_r.count or 0,
-        "this_week":        week_r.count or 0,
-        "daily_counts":     daily_counts,
-        "recent_questions": [r["question"] for r in (recent.data or [])]
+        "total":                total_r.count or 0,
+        "today":                today_r.count or 0,
+        "this_week":            this_week_count,
+        "prev_week":            prev_week_count,
+        "week_growth":          week_growth,
+        "daily_counts":         daily_counts,
+        "hourly_distribution":  hourly_distribution,
+        "top_questions":        top_questions,
+        "recent_questions":     [r["question"] for r in (recent.data or [])]
     }
 
 
