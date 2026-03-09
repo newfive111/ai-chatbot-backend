@@ -1,6 +1,6 @@
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from typing import Optional, Set, Dict
 from datetime import datetime, timedelta
@@ -157,6 +157,8 @@ class UpdateBotRequest(BaseModel):
     business_hours: Optional[dict] = None
     # 關鍵字觸發
     keyword_triggers: Optional[list] = None
+    # Instagram
+    instagram_page_token: Optional[str] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -620,6 +622,100 @@ async def get_conversations(
         .limit(100)\
         .execute()
     return result.data
+
+
+# ──────────────────────────────────────
+# Instagram Webhook
+# ──────────────────────────────────────
+
+@app.get("/instagram/webhook/{bot_id}")
+async def instagram_webhook_verify(
+    bot_id: str,
+    hub_mode: Optional[str]         = Query(None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
+    hub_challenge: Optional[str]    = Query(None, alias="hub.challenge"),
+):
+    """Meta Webhook 驗證：Verify Token = bot_id"""
+    if hub_mode == "subscribe" and hub_verify_token == bot_id:
+        logging.info(f"[Instagram] Webhook verified for bot {bot_id[:8]}")
+        return PlainTextResponse(hub_challenge)
+    raise HTTPException(403, "驗證失敗：Verify Token 不符")
+
+
+@app.post("/instagram/webhook/{bot_id}")
+async def instagram_webhook(bot_id: str, request: Request):
+    """接收 Instagram DM，呼叫 AI 回覆"""
+    data = await request.json()
+
+    # Meta 驗證 ping
+    if data.get("object") not in ("instagram", "page"):
+        return {"status": "ignored"}
+
+    for entry in data.get("entry", []):
+        for event in entry.get("messaging", []):
+            sender_id = event.get("sender", {}).get("id")
+            msg       = event.get("message", {})
+            text      = msg.get("text", "").strip()
+
+            # 忽略：echo（自己發的訊息）、無文字
+            if not text or msg.get("is_echo"):
+                continue
+
+            logging.info(f"[Instagram] bot={bot_id[:8]} sender={sender_id} msg={text[:50]}")
+            asyncio.create_task(_process_instagram_message(bot_id, sender_id, text))
+
+    return {"status": "ok"}
+
+
+async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
+    """非同步處理 Instagram 訊息"""
+    try:
+        bot = _get_bot_config(bot_id)
+        page_token = bot.get("instagram_page_token")
+        if not page_token:
+            logging.warning(f"[Instagram] bot {bot_id[:8]} has no page_token, skipping")
+            return
+
+        bot_name       = bot.get("name", "AI 助理")
+        api_key        = bot.get("anthropic_api_key")
+        sheet_id       = bot.get("sheet_id")
+        collect_fields = bot.get("collect_fields") or []
+        system_prompt  = bot.get("system_prompt") or None
+        calendar_id    = bot.get("calendar_id") or None
+        slot_duration  = bot.get("slot_duration_minutes") or 60
+        business_hours = bot.get("business_hours") or None
+        keyword_triggers = bot.get("keyword_triggers") or None
+        session_id     = f"ig_{bot_id}_{sender_id}"
+
+        try:
+            answer = generate_answer(
+                bot_id, text, bot_name,
+                api_key=api_key,
+                collect_fields=collect_fields if collect_fields else None,
+                sheet_id=sheet_id,
+                session_id=session_id,
+                custom_system_prompt=system_prompt,
+                calendar_id=calendar_id,
+                slot_duration_minutes=slot_duration,
+                business_hours=business_hours,
+                keyword_triggers=keyword_triggers,
+            )
+        except Exception as e:
+            if "NO_API_KEY" in str(e):
+                answer = "⚠️ 此 Bot 尚未設定 Gemini API Key，暫時無法回應。"
+            else:
+                raise
+
+        from app.instagram.webhook import send_instagram_message
+        status = await send_instagram_message(sender_id, answer, page_token)
+        logging.info(f"[Instagram] Sent reply to {sender_id}, status={status}")
+
+        supabase.table("conversations").insert({
+            "bot_id": bot_id, "question": text, "answer": answer
+        }).execute()
+
+    except Exception as e:
+        logging.error(f"[Instagram] process error: {e}")
 
 
 @app.get("/")
