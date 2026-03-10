@@ -159,6 +159,8 @@ class UpdateBotRequest(BaseModel):
     keyword_triggers: Optional[list] = None
     # Instagram
     instagram_page_token: Optional[str] = None
+    # 防抖
+    debounce_seconds: Optional[int] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -342,14 +344,14 @@ def _get_bot_config(bot_id: str) -> dict:
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, "
         "line_channel_secret, line_channel_access_token, "
-        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers"
+        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
 
-async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str):
+async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce_seconds: int = 15):
     """防抖計時到期後，合併訊息並呼叫 AI 回覆"""
-    await asyncio.sleep(DEBOUNCE_SECONDS)
+    await asyncio.sleep(debounce_seconds)
 
     buf = _line_buffers.pop(buf_key, None)
     if not buf:
@@ -484,9 +486,10 @@ async def line_webhook(bot_id: str, request: Request):
             }
 
         # 啟動新計時器
-        task = asyncio.create_task(_process_line_buffer(bot_id, user_id, buf_key))
+        bot_debounce = bot.get("debounce_seconds") or 15
+        task = asyncio.create_task(_process_line_buffer(bot_id, user_id, buf_key, bot_debounce))
         _line_buffers[buf_key]["task"] = task
-        logging.info(f"[LINE] Buffered msg from {user_id}: '{user_msg}' ({DEBOUNCE_SECONDS}s timer)")
+        logging.info(f"[LINE] Buffered msg from {user_id}: '{user_msg}' ({bot_debounce}s timer)")
 
     # 立即回 200 給 LINE Server，避免 timeout
     return {"status": "ok"}
