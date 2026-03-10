@@ -328,11 +328,15 @@ async def chat(bot_id: str, body: ChatRequest):
             return {"answer": "⚠️ 尚未設定 Gemini API Key，請前往「⚙️ 設定」頁面填入後再試。"}
         raise
 
-    supabase.table("conversations").insert({
-        "bot_id": bot_id,
-        "question": body.question,
-        "answer": answer
-    }).execute()
+    # 只記錄真實流量（widget_ 或 line_ 開頭），排除測試對話
+    sid = body.session_id or ""
+    if sid.startswith("widget_") or sid.startswith("line_"):
+        supabase.table("conversations").insert({
+            "bot_id": bot_id,
+            "question": body.question,
+            "answer": answer,
+            "session_id": sid,
+        }).execute()
 
     return {"answer": answer}
 
