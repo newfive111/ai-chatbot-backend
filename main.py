@@ -170,13 +170,15 @@ async def update_bot(
 ):
     get_user_id(authorization)
     update_data = {}
-    for k, v in body.model_dump().items():
+    # exclude_unset=True：只處理請求中明確傳入的欄位，避免未傳的欄位被誤清空
+    for k, v in body.model_dump(exclude_unset=True).items():
         if v is not None:
             update_data[k] = v
         elif k in ("collect_fields", "quick_replies", "keyword_triggers"):
-            # 允許儲存空 list
+            # 明確傳入空 list → 允許清空
             update_data[k] = []
-        elif k in ("system_prompt", "welcome_message") and v == "":
+        elif k in ("system_prompt", "welcome_message"):
+            # 明確傳入空字串 → 允許清空
             update_data[k] = ""
     if update_data:
         supabase.table("bots").update(update_data).eq("id", bot_id).execute()
