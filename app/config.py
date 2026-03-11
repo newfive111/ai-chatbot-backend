@@ -10,12 +10,13 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 JWT_SECRET = os.getenv("JWT_SECRET", "changeme")
 
-# Stripe
-STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+# Lemon Squeezy
+LS_API_KEY              = os.getenv("LS_API_KEY", "")
+LS_WEBHOOK_SECRET       = os.getenv("LS_WEBHOOK_SECRET", "")
+LS_STORE_ID             = os.getenv("LS_STORE_ID", "")
 
-# Stripe Price IDs（填入你在 Stripe 後台建立的 price_xxx）
-STRIPE_PRICE_PRO_MONTHLY      = os.getenv("STRIPE_PRICE_PRO_MONTHLY", "")
-STRIPE_PRICE_PRO_ANNUAL       = os.getenv("STRIPE_PRICE_PRO_ANNUAL", "")
-STRIPE_PRICE_BIZ_MONTHLY      = os.getenv("STRIPE_PRICE_BIZ_MONTHLY", "")
-STRIPE_PRICE_BIZ_ANNUAL       = os.getenv("STRIPE_PRICE_BIZ_ANNUAL", "")
+# Lemon Squeezy Variant IDs（在後台 Products → Variants 取得）
+LS_VARIANT_PRO_MONTHLY  = os.getenv("LS_VARIANT_PRO_MONTHLY", "")
+LS_VARIANT_PRO_ANNUAL   = os.getenv("LS_VARIANT_PRO_ANNUAL", "")
+LS_VARIANT_BIZ_MONTHLY  = os.getenv("LS_VARIANT_BIZ_MONTHLY", "")
+LS_VARIANT_BIZ_ANNUAL   = os.getenv("LS_VARIANT_BIZ_ANNUAL", "")

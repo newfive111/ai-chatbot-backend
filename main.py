@@ -728,29 +728,38 @@ async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
 
 
 # ──────────────────────────────────────
-# Stripe 付費整合
+# Lemon Squeezy 付費整合
 # ──────────────────────────────────────
 
+import hmac
+import hashlib
+import httpx as _httpx
+
 from app.config import (
-    STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
-    STRIPE_PRICE_PRO_MONTHLY, STRIPE_PRICE_PRO_ANNUAL,
-    STRIPE_PRICE_BIZ_MONTHLY, STRIPE_PRICE_BIZ_ANNUAL,
+    LS_API_KEY, LS_WEBHOOK_SECRET, LS_STORE_ID,
+    LS_VARIANT_PRO_MONTHLY, LS_VARIANT_PRO_ANNUAL,
+    LS_VARIANT_BIZ_MONTHLY, LS_VARIANT_BIZ_ANNUAL,
 )
 
-# plan + cycle → price_id 對照表
-PRICE_MAP = {
-    ("pro",      "monthly"): STRIPE_PRICE_PRO_MONTHLY,
-    ("pro",      "annual"):  STRIPE_PRICE_PRO_ANNUAL,
-    ("business", "monthly"): STRIPE_PRICE_BIZ_MONTHLY,
-    ("business", "annual"):  STRIPE_PRICE_BIZ_ANNUAL,
+LS_BASE = "https://api.lemonsqueezy.com/v1"
+
+# plan + cycle → variant_id 對照表
+VARIANT_MAP = {
+    ("pro",      "monthly"): LS_VARIANT_PRO_MONTHLY,
+    ("pro",      "annual"):  LS_VARIANT_PRO_ANNUAL,
+    ("business", "monthly"): LS_VARIANT_BIZ_MONTHLY,
+    ("business", "annual"):  LS_VARIANT_BIZ_ANNUAL,
 }
 
-PLAN_NAMES = {
-    ("pro",      "monthly"): "專業版 月付",
-    ("pro",      "annual"):  "專業版 年付",
-    ("business", "monthly"): "商業版 月付",
-    ("business", "annual"):  "商業版 年付",
-}
+# variant_id → (plan, cycle) 反查
+def _variant_to_plan(variant_id: str) -> tuple:
+    for k, v in VARIANT_MAP.items():
+        if v == variant_id:
+            return k
+    return ("free", None)
+
+def _ls_headers():
+    return {"Authorization": f"Bearer {LS_API_KEY}", "Accept": "application/vnd.api+json", "Content-Type": "application/vnd.api+json"}
 
 
 class CheckoutRequest(BaseModel):
@@ -763,75 +772,89 @@ async def create_checkout(
     body: CheckoutRequest,
     authorization: Optional[str] = Header(None),
 ):
-    """建立 Stripe Checkout Session，前端 redirect 過去付款"""
-    import stripe
+    """建立 Lemon Squeezy Checkout，前端 redirect 過去付款"""
     user_id = get_user_id(authorization)
 
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(500, "Stripe 尚未設定")
+    if not LS_API_KEY:
+        raise HTTPException(500, "Lemon Squeezy 尚未設定")
 
-    price_id = PRICE_MAP.get((body.plan, body.billing_cycle))
-    if not price_id:
+    variant_id = VARIANT_MAP.get((body.plan, body.billing_cycle))
+    if not variant_id:
         raise HTTPException(400, f"無效的方案：{body.plan}/{body.billing_cycle}")
 
-    stripe.api_key = STRIPE_SECRET_KEY
-
-    # 取或建 Stripe Customer
-    sub_row = supabase.table("subscriptions").select("stripe_customer_id").eq("user_id", user_id).execute()
-    customer_id = sub_row.data[0]["stripe_customer_id"] if sub_row.data and sub_row.data[0].get("stripe_customer_id") else None
-
-    if not customer_id:
-        # 取用戶 email
+    # 取用戶 email
+    try:
         user_info = supabase.auth.admin.get_user_by_id(user_id)
-        email = user_info.user.email if user_info.user else None
-        customer = stripe.Customer.create(email=email, metadata={"user_id": user_id})
-        customer_id = customer.id
+        email = user_info.user.email if user_info.user else ""
+    except Exception:
+        email = ""
 
-    session = stripe.checkout.Session.create(
-        customer=customer_id,
-        payment_method_types=["card"],
-        line_items=[{"price": price_id, "quantity": 1}],
-        mode="subscription",
-        success_url="https://landehui.online/dashboard?payment=success",
-        cancel_url="https://landehui.online/pricing?payment=canceled",
-        metadata={"user_id": user_id, "plan": body.plan, "billing_cycle": body.billing_cycle},
-        subscription_data={"metadata": {"user_id": user_id}},
-    )
-    return {"checkout_url": session.url}
+    payload = {
+        "data": {
+            "type": "checkouts",
+            "attributes": {
+                "checkout_data": {
+                    "email": email,
+                    "custom": {
+                        "user_id":      user_id,
+                        "plan":         body.plan,
+                        "billing_cycle": body.billing_cycle,
+                    }
+                },
+                "checkout_options": {
+                    "embed": False,
+                    "media": False,
+                },
+                "product_options": {
+                    "redirect_url":    "https://landehui.online/dashboard?payment=success",
+                    "receipt_link_url": "https://landehui.online/dashboard",
+                },
+            },
+            "relationships": {
+                "store":   {"data": {"type": "stores",   "id": str(LS_STORE_ID)}},
+                "variant": {"data": {"type": "variants", "id": str(variant_id)}},
+            }
+        }
+    }
+
+    async with _httpx.AsyncClient() as client:
+        r = await client.post(f"{LS_BASE}/checkouts", json=payload, headers=_ls_headers(), timeout=15)
+        if r.status_code not in (200, 201):
+            logging.error(f"[LS] Checkout error {r.status_code}: {r.text[:200]}")
+            raise HTTPException(502, "建立付款連結失敗，請稍後再試")
+        checkout_url = r.json()["data"]["attributes"]["url"]
+
+    return {"checkout_url": checkout_url}
 
 
 @app.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
-    """Stripe Webhook：付款成功 / 訂閱取消"""
-    import stripe
-    stripe.api_key = STRIPE_SECRET_KEY
+async def ls_webhook(request: Request):
+    """Lemon Squeezy Webhook：訂閱建立 / 取消 / 付款失敗"""
+    payload    = await request.body()
+    sig_header = request.headers.get("X-Signature", "")
 
-    payload   = await request.body()
-    sig_header = request.headers.get("stripe-signature", "")
+    # 驗簽名
+    if LS_WEBHOOK_SECRET:
+        expected = hmac.new(LS_WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig_header):
+            raise HTTPException(400, "Webhook 簽名驗證失敗")
 
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(400, "Webhook 簽名驗證失敗")
+    data  = json.loads(payload)
+    etype = data.get("meta", {}).get("event_name", "")
+    attrs = data.get("data", {}).get("attributes", {})
+    custom = data.get("meta", {}).get("custom_data", {})
 
-    etype = event["type"]
-    data  = event["data"]["object"]
+    logging.info(f"[LS] Webhook event: {etype}")
 
-    if etype == "checkout.session.completed":
-        meta     = data.get("metadata", {})
-        user_id  = meta.get("user_id")
-        plan     = meta.get("plan")
-        cycle    = meta.get("billing_cycle")
-        cust_id  = data.get("customer")
-        sub_id   = data.get("subscription")
+    if etype == "subscription_created":
+        user_id  = custom.get("user_id") or attrs.get("user_email")
+        plan     = custom.get("plan", "pro")
+        cycle    = custom.get("billing_cycle", "monthly")
+        sub_id   = str(data["data"]["id"])
+        cust_id  = str(attrs.get("customer_id", ""))
+        renews   = attrs.get("renews_at") or attrs.get("ends_at")
 
-        if user_id and plan and cycle:
-            # 取 subscription 結束時間
-            period_end = None
-            if sub_id:
-                sub = stripe.Subscription.retrieve(sub_id)
-                period_end = datetime.utcfromtimestamp(sub["current_period_end"]).isoformat()
-
+        if user_id:
             supabase.table("subscriptions").upsert({
                 "user_id":                user_id,
                 "stripe_customer_id":     cust_id,
@@ -839,34 +862,41 @@ async def stripe_webhook(request: Request):
                 "plan":                   plan,
                 "billing_cycle":          cycle,
                 "status":                 "active",
-                "current_period_end":     period_end,
+                "current_period_end":     renews,
                 "updated_at":             datetime.utcnow().isoformat(),
             }).execute()
-            logging.info(f"[Stripe] Subscribed: user={user_id[:8]} plan={plan}/{cycle}")
+            logging.info(f"[LS] Subscribed: user={user_id[:8]} plan={plan}/{cycle}")
 
-    elif etype in ("customer.subscription.deleted", "customer.subscription.updated"):
-        sub     = data
-        sub_id  = sub.get("id")
-        status  = sub.get("status", "canceled")
-
+    elif etype in ("subscription_cancelled", "subscription_expired"):
+        sub_id = str(data["data"]["id"])
         row = supabase.table("subscriptions").select("user_id").eq("stripe_subscription_id", sub_id).execute()
         if row.data:
-            new_plan = "free" if status in ("canceled", "unpaid") else row.data[0].get("plan", "free")
             supabase.table("subscriptions").update({
-                "status":    status,
-                "plan":      new_plan,
+                "status":     "canceled",
+                "plan":       "free",
                 "updated_at": datetime.utcnow().isoformat(),
             }).eq("stripe_subscription_id", sub_id).execute()
-            logging.info(f"[Stripe] Sub {etype}: sub={sub_id[:8]} status={status}")
+            logging.info(f"[LS] Cancelled: sub={sub_id}")
 
-    elif etype == "invoice.payment_failed":
-        sub_id = data.get("subscription")
+    elif etype == "subscription_payment_failed":
+        sub_id = str(attrs.get("subscription_id", ""))
         if sub_id:
             supabase.table("subscriptions").update({
-                "status": "past_due",
+                "status":     "past_due",
                 "updated_at": datetime.utcnow().isoformat(),
             }).eq("stripe_subscription_id", sub_id).execute()
-            logging.info(f"[Stripe] Payment failed: sub={sub_id[:8]}")
+            logging.info(f"[LS] Payment failed: sub={sub_id}")
+
+    elif etype == "subscription_updated":
+        sub_id = str(data["data"]["id"])
+        status = attrs.get("status", "active")
+        renews = attrs.get("renews_at") or attrs.get("ends_at")
+        update = {"status": status, "updated_at": datetime.utcnow().isoformat()}
+        if renews:
+            update["current_period_end"] = renews
+        if status in ("cancelled", "expired"):
+            update["plan"] = "free"
+        supabase.table("subscriptions").update(update).eq("stripe_subscription_id", sub_id).execute()
 
     return {"received": True}
 
@@ -888,21 +918,25 @@ async def get_subscription(authorization: Optional[str] = Header(None)):
 
 
 @app.post("/stripe/portal")
-async def customer_portal(authorization: Optional[str] = Header(None)):
-    """建立 Stripe Customer Portal Session，讓用戶自己管理/取消訂閱"""
-    import stripe
-    stripe.api_key = STRIPE_SECRET_KEY
+async def ls_portal(authorization: Optional[str] = Header(None)):
+    """取得 Lemon Squeezy Customer Portal URL"""
     user_id = get_user_id(authorization)
 
     row = supabase.table("subscriptions").select("stripe_customer_id").eq("user_id", user_id).execute()
     if not row.data or not row.data[0].get("stripe_customer_id"):
         raise HTTPException(404, "找不到訂閱資料")
 
-    session = stripe.billing_portal.Session.create(
-        customer=row.data[0]["stripe_customer_id"],
-        return_url="https://landehui.online/dashboard",
-    )
-    return {"portal_url": session.url}
+    cust_id = row.data[0]["stripe_customer_id"]
+    async with _httpx.AsyncClient() as client:
+        r = await client.get(f"{LS_BASE}/customers/{cust_id}", headers=_ls_headers(), timeout=10)
+        if r.status_code != 200:
+            raise HTTPException(502, "無法取得客戶資料")
+        portal_url = r.json()["data"]["attributes"].get("urls", {}).get("customer_portal")
+
+    if not portal_url:
+        raise HTTPException(404, "找不到管理頁面連結")
+
+    return {"portal_url": portal_url}
 
 
 @app.get("/")
