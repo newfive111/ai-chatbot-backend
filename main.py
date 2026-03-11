@@ -942,3 +942,94 @@ async def ls_portal(authorization: Optional[str] = Header(None)):
 @app.get("/")
 def root():
     return {"status": "AI Chatbot SaaS running 🔥"}
+
+
+# ──────────────────────────────────────
+# Admin
+# ──────────────────────────────────────
+
+ADMIN_EMAIL = "youfanliao444@gmail.com"
+
+def require_admin(authorization: str = None) -> str:
+    user_id = get_user_id(authorization)
+    user_info = supabase.auth.admin.get_user_by_id(user_id)
+    if not user_info.user or user_info.user.email != ADMIN_EMAIL:
+        raise HTTPException(403, "無權限")
+    return user_id
+
+
+@app.get("/admin/stats")
+async def admin_stats(authorization: Optional[str] = Header(None)):
+    require_admin(authorization)
+    users   = supabase.auth.admin.list_users()
+    total_users = len(users) if isinstance(users, list) else 0
+    bots    = supabase.table("bots").select("id", count="exact").execute()
+    subs    = supabase.table("subscriptions").select("plan").execute()
+    plan_counts = {"free": 0, "pro": 0, "business": 0}
+    for s in (subs.data or []):
+        p = s.get("plan", "free")
+        plan_counts[p] = plan_counts.get(p, 0) + 1
+    paid = plan_counts["pro"] + plan_counts["business"]
+    return {
+        "total_users": total_users,
+        "total_bots":  bots.count or 0,
+        "paid_users":  paid,
+        "plan_counts": plan_counts,
+    }
+
+
+@app.get("/admin/users")
+async def admin_list_users(authorization: Optional[str] = Header(None)):
+    require_admin(authorization)
+    users = supabase.auth.admin.list_users()
+    user_list = users if isinstance(users, list) else []
+
+    subs_rows = supabase.table("subscriptions").select("*").execute()
+    subs_map  = {s["user_id"]: s for s in (subs_rows.data or [])}
+
+    bots_rows = supabase.table("bots").select("user_id").execute()
+    bot_count: dict = {}
+    for b in (bots_rows.data or []):
+        uid = b["user_id"]
+        bot_count[uid] = bot_count.get(uid, 0) + 1
+
+    result = []
+    for u in user_list:
+        uid  = u.id
+        sub  = subs_map.get(uid, {})
+        result.append({
+            "user_id":    uid,
+            "email":      u.email,
+            "created_at": str(u.created_at),
+            "plan":       sub.get("plan", "free"),
+            "status":     sub.get("status", "active"),
+            "billing_cycle":      sub.get("billing_cycle"),
+            "current_period_end": sub.get("current_period_end"),
+            "bot_count":  bot_count.get(uid, 0),
+        })
+
+    result.sort(key=lambda x: x["created_at"], reverse=True)
+    return result
+
+
+class AdminPlanUpdate(BaseModel):
+    plan: str           # 'free' | 'pro' | 'business'
+    billing_cycle: Optional[str] = None   # 'monthly' | 'annual' | None
+
+
+@app.patch("/admin/users/{target_user_id}/plan")
+async def admin_update_plan(
+    target_user_id: str,
+    body: AdminPlanUpdate,
+    authorization: Optional[str] = Header(None),
+):
+    require_admin(authorization)
+    now = datetime.utcnow().isoformat()
+    supabase.table("subscriptions").upsert({
+        "user_id":       target_user_id,
+        "plan":          body.plan,
+        "billing_cycle": body.billing_cycle,
+        "status":        "active",
+        "updated_at":    now,
+    }, on_conflict="user_id").execute()
+    return {"ok": True, "user_id": target_user_id, "plan": body.plan}
