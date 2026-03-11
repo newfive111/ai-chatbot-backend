@@ -1,6 +1,7 @@
 import jwt
 import uuid
 from datetime import datetime, timedelta
+from fastapi import HTTPException
 from app.config import JWT_SECRET
 
 
@@ -16,9 +17,9 @@ def decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except jwt.ExpiredSignatureError:
-        raise Exception("Token 過期")
+        raise HTTPException(401, "Token 過期，請重新登入")
     except jwt.InvalidTokenError:
-        raise Exception("Token 無效")
+        raise HTTPException(401, "Token 無效，請重新登入")
 
 
 def generate_bot_id() -> str:
