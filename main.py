@@ -727,6 +727,184 @@ async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
         logging.error(f"[Instagram] process error: {e}")
 
 
+# ──────────────────────────────────────
+# Stripe 付費整合
+# ──────────────────────────────────────
+
+from app.config import (
+    STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
+    STRIPE_PRICE_PRO_MONTHLY, STRIPE_PRICE_PRO_ANNUAL,
+    STRIPE_PRICE_BIZ_MONTHLY, STRIPE_PRICE_BIZ_ANNUAL,
+)
+
+# plan + cycle → price_id 對照表
+PRICE_MAP = {
+    ("pro",      "monthly"): STRIPE_PRICE_PRO_MONTHLY,
+    ("pro",      "annual"):  STRIPE_PRICE_PRO_ANNUAL,
+    ("business", "monthly"): STRIPE_PRICE_BIZ_MONTHLY,
+    ("business", "annual"):  STRIPE_PRICE_BIZ_ANNUAL,
+}
+
+PLAN_NAMES = {
+    ("pro",      "monthly"): "專業版 月付",
+    ("pro",      "annual"):  "專業版 年付",
+    ("business", "monthly"): "商業版 月付",
+    ("business", "annual"):  "商業版 年付",
+}
+
+
+class CheckoutRequest(BaseModel):
+    plan: str          # 'pro' | 'business'
+    billing_cycle: str # 'monthly' | 'annual'
+
+
+@app.post("/stripe/checkout")
+async def create_checkout(
+    body: CheckoutRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """建立 Stripe Checkout Session，前端 redirect 過去付款"""
+    import stripe
+    user_id = get_user_id(authorization)
+
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(500, "Stripe 尚未設定")
+
+    price_id = PRICE_MAP.get((body.plan, body.billing_cycle))
+    if not price_id:
+        raise HTTPException(400, f"無效的方案：{body.plan}/{body.billing_cycle}")
+
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    # 取或建 Stripe Customer
+    sub_row = supabase.table("subscriptions").select("stripe_customer_id").eq("user_id", user_id).execute()
+    customer_id = sub_row.data[0]["stripe_customer_id"] if sub_row.data and sub_row.data[0].get("stripe_customer_id") else None
+
+    if not customer_id:
+        # 取用戶 email
+        user_info = supabase.auth.admin.get_user_by_id(user_id)
+        email = user_info.user.email if user_info.user else None
+        customer = stripe.Customer.create(email=email, metadata={"user_id": user_id})
+        customer_id = customer.id
+
+    session = stripe.checkout.Session.create(
+        customer=customer_id,
+        payment_method_types=["card"],
+        line_items=[{"price": price_id, "quantity": 1}],
+        mode="subscription",
+        success_url="https://landehui.online/dashboard?payment=success",
+        cancel_url="https://landehui.online/pricing?payment=canceled",
+        metadata={"user_id": user_id, "plan": body.plan, "billing_cycle": body.billing_cycle},
+        subscription_data={"metadata": {"user_id": user_id}},
+    )
+    return {"checkout_url": session.url}
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """Stripe Webhook：付款成功 / 訂閱取消"""
+    import stripe
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    payload   = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(400, "Webhook 簽名驗證失敗")
+
+    etype = event["type"]
+    data  = event["data"]["object"]
+
+    if etype == "checkout.session.completed":
+        meta     = data.get("metadata", {})
+        user_id  = meta.get("user_id")
+        plan     = meta.get("plan")
+        cycle    = meta.get("billing_cycle")
+        cust_id  = data.get("customer")
+        sub_id   = data.get("subscription")
+
+        if user_id and plan and cycle:
+            # 取 subscription 結束時間
+            period_end = None
+            if sub_id:
+                sub = stripe.Subscription.retrieve(sub_id)
+                period_end = datetime.utcfromtimestamp(sub["current_period_end"]).isoformat()
+
+            supabase.table("subscriptions").upsert({
+                "user_id":                user_id,
+                "stripe_customer_id":     cust_id,
+                "stripe_subscription_id": sub_id,
+                "plan":                   plan,
+                "billing_cycle":          cycle,
+                "status":                 "active",
+                "current_period_end":     period_end,
+                "updated_at":             datetime.utcnow().isoformat(),
+            }).execute()
+            logging.info(f"[Stripe] Subscribed: user={user_id[:8]} plan={plan}/{cycle}")
+
+    elif etype in ("customer.subscription.deleted", "customer.subscription.updated"):
+        sub     = data
+        sub_id  = sub.get("id")
+        status  = sub.get("status", "canceled")
+
+        row = supabase.table("subscriptions").select("user_id").eq("stripe_subscription_id", sub_id).execute()
+        if row.data:
+            new_plan = "free" if status in ("canceled", "unpaid") else row.data[0].get("plan", "free")
+            supabase.table("subscriptions").update({
+                "status":    status,
+                "plan":      new_plan,
+                "updated_at": datetime.utcnow().isoformat(),
+            }).eq("stripe_subscription_id", sub_id).execute()
+            logging.info(f"[Stripe] Sub {etype}: sub={sub_id[:8]} status={status}")
+
+    elif etype == "invoice.payment_failed":
+        sub_id = data.get("subscription")
+        if sub_id:
+            supabase.table("subscriptions").update({
+                "status": "past_due",
+                "updated_at": datetime.utcnow().isoformat(),
+            }).eq("stripe_subscription_id", sub_id).execute()
+            logging.info(f"[Stripe] Payment failed: sub={sub_id[:8]}")
+
+    return {"received": True}
+
+
+@app.get("/me/subscription")
+async def get_subscription(authorization: Optional[str] = Header(None)):
+    """取得目前用戶的訂閱狀態"""
+    user_id = get_user_id(authorization)
+    row = supabase.table("subscriptions").select("*").eq("user_id", user_id).execute()
+    if not row.data:
+        return {"plan": "free", "status": "active", "billing_cycle": None, "current_period_end": None}
+    s = row.data[0]
+    return {
+        "plan":               s.get("plan", "free"),
+        "status":             s.get("status", "active"),
+        "billing_cycle":      s.get("billing_cycle"),
+        "current_period_end": s.get("current_period_end"),
+    }
+
+
+@app.post("/stripe/portal")
+async def customer_portal(authorization: Optional[str] = Header(None)):
+    """建立 Stripe Customer Portal Session，讓用戶自己管理/取消訂閱"""
+    import stripe
+    stripe.api_key = STRIPE_SECRET_KEY
+    user_id = get_user_id(authorization)
+
+    row = supabase.table("subscriptions").select("stripe_customer_id").eq("user_id", user_id).execute()
+    if not row.data or not row.data[0].get("stripe_customer_id"):
+        raise HTTPException(404, "找不到訂閱資料")
+
+    session = stripe.billing_portal.Session.create(
+        customer=row.data[0]["stripe_customer_id"],
+        return_url="https://landehui.online/dashboard",
+    )
+    return {"portal_url": session.url}
+
+
 @app.get("/")
 def root():
     return {"status": "AI Chatbot SaaS running 🔥"}
