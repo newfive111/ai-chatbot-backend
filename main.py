@@ -131,9 +131,14 @@ async def create_bot(
 
 @app.get("/bots")
 async def list_bots(authorization: Optional[str] = Header(None)):
-    user_id = get_user_id(authorization)
-    result = supabase.table("bots").select("*").eq("user_id", user_id).execute()
-    return result.data
+    user_id   = get_user_id(authorization)
+    slots     = get_bot_slots(user_id)
+    result    = supabase.table("bots").select("*").eq("user_id", user_id).order("created_at").execute()
+    bots      = result.data or []
+    # 最早建立的 bot 依序分配付費名額
+    for i, bot in enumerate(bots):
+        bot["plan"] = "paid" if i < slots else "free"
+    return bots
 
 @app.get("/bots/{bot_id}")
 async def get_bot(bot_id: str, authorization: Optional[str] = Header(None)):
