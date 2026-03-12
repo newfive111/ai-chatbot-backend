@@ -105,6 +105,19 @@ def get_bot_slots(user_id: str) -> int:
     return sum(r.get("slots", 1) for r in (rows.data or []))
 
 
+def is_bot_paid(bot_id: str) -> bool:
+    """檢查此 bot 是否為付費 bot（有付費名額）"""
+    bot_row = supabase.table("bots").select("user_id").eq("id", bot_id).execute()
+    if not bot_row.data:
+        return False
+    user_id = bot_row.data[0]["user_id"]
+    slots   = get_bot_slots(user_id)
+    all_bots = supabase.table("bots").select("id").eq("user_id", user_id).order("created_at").execute()
+    bot_ids  = [b["id"] for b in (all_bots.data or [])]
+    idx      = bot_ids.index(bot_id) if bot_id in bot_ids else len(bot_ids)
+    return idx < slots
+
+
 FREE_MSG_LIMIT = 300
 
 def check_message_allowed(bot_id: str) -> tuple[bool, str]:
@@ -357,6 +370,10 @@ class ChatRequest(BaseModel):
 
 @app.post("/bots/{bot_id}/chat")
 async def chat(bot_id: str, body: ChatRequest):
+    # 免費 Bot 不支援網站 Widget
+    if not is_bot_paid(bot_id):
+        return {"answer": "此 Bot 為免費方案，不支援網站嵌入功能。請升級方案後使用，或透過 LINE 試用。"}
+
     allowed, reason = check_message_allowed(bot_id)
     if not allowed:
         return {"answer": reason}
