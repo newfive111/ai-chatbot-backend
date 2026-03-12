@@ -96,13 +96,13 @@ def get_user_id(authorization: str = None) -> str:
     return payload["user_id"]
 
 def get_bot_slots(user_id: str) -> int:
-    """回傳該用戶目前有效的付費 Bot 訂閱數量"""
+    """回傳該用戶目前有效的付費 Bot 名額總數（商業版=10, 單Bot=1）"""
     rows = supabase.table("bot_subscriptions") \
-        .select("id", count="exact") \
+        .select("slots") \
         .eq("user_id", user_id) \
         .eq("status", "active") \
         .execute()
-    return rows.count or 0
+    return sum(r.get("slots", 1) for r in (rows.data or []))
 
 
 @app.post("/bots")
@@ -762,34 +762,26 @@ import httpx as _httpx
 
 from app.config import (
     LS_API_KEY, LS_WEBHOOK_SECRET, LS_STORE_ID,
-    LS_VARIANT_PRO_MONTHLY, LS_VARIANT_PRO_ANNUAL,
-    LS_VARIANT_BIZ_MONTHLY, LS_VARIANT_BIZ_ANNUAL,
+    LS_VARIANT_BOT_MONTHLY, LS_VARIANT_BUSINESS_MONTHLY,
 )
 
 LS_BASE = "https://api.lemonsqueezy.com/v1"
 
-# plan + cycle → variant_id 對照表
-VARIANT_MAP = {
-    ("pro",      "monthly"): LS_VARIANT_PRO_MONTHLY,
-    ("pro",      "annual"):  LS_VARIANT_PRO_ANNUAL,
-    ("business", "monthly"): LS_VARIANT_BIZ_MONTHLY,
-    ("business", "annual"):  LS_VARIANT_BIZ_ANNUAL,
+# variant_id → bot slots 數量
+VARIANT_SLOTS = {
+    LS_VARIANT_BOT_MONTHLY:      1,   # Bot 訂閱 1290/月 → 1 slot
+    LS_VARIANT_BUSINESS_MONTHLY: 10,  # 商業版 4680/月 → 10 slots
 }
 
-# variant_id → (plan, cycle) 反查
-def _variant_to_plan(variant_id: str) -> tuple:
-    for k, v in VARIANT_MAP.items():
-        if v == variant_id:
-            return k
-    return ("free", None)
+def _variant_to_slots(variant_id: str) -> int:
+    return VARIANT_SLOTS.get(variant_id, 1)
 
 def _ls_headers():
     return {"Authorization": f"Bearer {LS_API_KEY}", "Accept": "application/vnd.api+json", "Content-Type": "application/vnd.api+json"}
 
 
 class CheckoutRequest(BaseModel):
-    plan: str = "bot"           # 保留相容性，固定使用 bot 月訂閱
-    billing_cycle: str = "monthly"
+    plan: str = "bot"   # "bot" = 1290/月, "business" = 4680/月
 
 
 @app.post("/stripe/checkout")
@@ -803,10 +795,14 @@ async def create_checkout(
     if not LS_API_KEY:
         raise HTTPException(500, "Lemon Squeezy 尚未設定")
 
-    # 固定使用 Pro Monthly variant（1290 TWD/月）
-    variant_id = LS_VARIANT_PRO_MONTHLY
-    if not variant_id:
-        raise HTTPException(500, "Bot 訂閱方案尚未設定")
+    if body.plan == "business":
+        variant_id = LS_VARIANT_BUSINESS_MONTHLY
+        if not variant_id:
+            raise HTTPException(500, "商業版方案尚未設定")
+    else:
+        variant_id = LS_VARIANT_BOT_MONTHLY
+        if not variant_id:
+            raise HTTPException(500, "Bot 訂閱方案尚未設定")
 
     # 取用戶 email
     try:
@@ -871,22 +867,24 @@ async def ls_webhook(request: Request):
     logging.info(f"[LS] Webhook event: {etype}")
 
     if etype == "subscription_created":
-        user_id = custom.get("user_id")
-        sub_id  = str(data["data"]["id"])
-        cust_id = str(attrs.get("customer_id", ""))
-        renews  = attrs.get("renews_at") or attrs.get("ends_at")
+        user_id    = custom.get("user_id")
+        sub_id     = str(data["data"]["id"])
+        cust_id    = str(attrs.get("customer_id", ""))
+        renews     = attrs.get("renews_at") or attrs.get("ends_at")
+        variant_id = str(attrs.get("variant_id", ""))
+        slots      = _variant_to_slots(variant_id)
 
         if user_id:
-            # 寫入 bot_subscriptions（每筆訂閱一列）
             supabase.table("bot_subscriptions").upsert({
-                "id":         sub_id,
-                "user_id":    user_id,
+                "id":          sub_id,
+                "user_id":     user_id,
                 "customer_id": cust_id,
-                "status":     "active",
-                "renews_at":  renews,
-                "created_at": datetime.utcnow().isoformat(),
+                "status":      "active",
+                "slots":       slots,
+                "renews_at":   renews,
+                "created_at":  datetime.utcnow().isoformat(),
             }, on_conflict="id").execute()
-            logging.info(f"[LS] Bot sub created: user={user_id[:8]} sub={sub_id}")
+            logging.info(f"[LS] Sub created: user={user_id[:8]} slots={slots} sub={sub_id}")
 
     elif etype in ("subscription_cancelled", "subscription_expired"):
         sub_id = str(data["data"]["id"])

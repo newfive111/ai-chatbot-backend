@@ -15,8 +15,6 @@ LS_API_KEY              = os.getenv("LS_API_KEY", "")
 LS_WEBHOOK_SECRET       = os.getenv("LS_WEBHOOK_SECRET", "")
 LS_STORE_ID             = os.getenv("LS_STORE_ID", "")
 
-# Lemon Squeezy Variant IDs（在後台 Products → Variants 取得）
-LS_VARIANT_PRO_MONTHLY  = os.getenv("LS_VARIANT_PRO_MONTHLY", "")
-LS_VARIANT_PRO_ANNUAL   = os.getenv("LS_VARIANT_PRO_ANNUAL", "")
-LS_VARIANT_BIZ_MONTHLY  = os.getenv("LS_VARIANT_BIZ_MONTHLY", "")
-LS_VARIANT_BIZ_ANNUAL   = os.getenv("LS_VARIANT_BIZ_ANNUAL", "")
+# Lemon Squeezy Variant IDs
+LS_VARIANT_BOT_MONTHLY      = os.getenv("LS_VARIANT_PRO_MONTHLY", "")   # Bot 訂閱 1290/月
+LS_VARIANT_BUSINESS_MONTHLY = os.getenv("LS_VARIANT_BUSINESS_MONTHLY", "")  # 商業版 4680/月
