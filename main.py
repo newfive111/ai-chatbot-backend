@@ -762,26 +762,31 @@ import httpx as _httpx
 
 from app.config import (
     LS_API_KEY, LS_WEBHOOK_SECRET, LS_STORE_ID,
-    LS_VARIANT_BOT_MONTHLY, LS_VARIANT_BUSINESS_MONTHLY,
+    LS_VARIANT_BOT_MONTHLY, LS_VARIANT_BOT_ANNUAL,
+    LS_VARIANT_BUSINESS_MONTHLY, LS_VARIANT_BUSINESS_ANNUAL,
 )
 
 LS_BASE = "https://api.lemonsqueezy.com/v1"
 
-# variant_id → bot slots 數量
-VARIANT_SLOTS = {
-    LS_VARIANT_BOT_MONTHLY:      1,   # Bot 訂閱 1290/月 → 1 slot
-    LS_VARIANT_BUSINESS_MONTHLY: 10,  # 商業版 4680/月 → 10 slots
-}
+# variant_id → bot slots 數量（module load 後才能建，用 lambda 延遲）
+def _get_variant_slots() -> dict:
+    return {
+        LS_VARIANT_BOT_MONTHLY:      1,
+        LS_VARIANT_BOT_ANNUAL:       1,
+        LS_VARIANT_BUSINESS_MONTHLY: 10,
+        LS_VARIANT_BUSINESS_ANNUAL:  10,
+    }
 
 def _variant_to_slots(variant_id: str) -> int:
-    return VARIANT_SLOTS.get(variant_id, 1)
+    return _get_variant_slots().get(variant_id, 1)
 
 def _ls_headers():
     return {"Authorization": f"Bearer {LS_API_KEY}", "Accept": "application/vnd.api+json", "Content-Type": "application/vnd.api+json"}
 
 
 class CheckoutRequest(BaseModel):
-    plan: str = "bot"   # "bot" = 1290/月, "business" = 4680/月
+    plan: str = "bot"            # "bot" | "business"
+    billing_cycle: str = "monthly"  # "monthly" | "annual"
 
 
 @app.post("/stripe/checkout")
@@ -789,18 +794,20 @@ async def create_checkout(
     body: CheckoutRequest,
     authorization: Optional[str] = Header(None),
 ):
-    """建立 Lemon Squeezy Checkout — 每個 Bot 1290/月"""
+    """建立 Lemon Squeezy Checkout"""
     user_id = get_user_id(authorization)
 
     if not LS_API_KEY:
         raise HTTPException(500, "Lemon Squeezy 尚未設定")
 
+    annual = body.billing_cycle == "annual"
+
     if body.plan == "business":
-        variant_id = LS_VARIANT_BUSINESS_MONTHLY
+        variant_id = LS_VARIANT_BUSINESS_ANNUAL if annual else LS_VARIANT_BUSINESS_MONTHLY
         if not variant_id:
             raise HTTPException(500, "商業版方案尚未設定")
     else:
-        variant_id = LS_VARIANT_BOT_MONTHLY
+        variant_id = LS_VARIANT_BOT_ANNUAL if annual else LS_VARIANT_BOT_MONTHLY
         if not variant_id:
             raise HTTPException(500, "Bot 訂閱方案尚未設定")
 
