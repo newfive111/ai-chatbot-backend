@@ -1048,20 +1048,24 @@ def require_admin(authorization: str = None) -> str:
 @app.get("/admin/stats")
 async def admin_stats(authorization: Optional[str] = Header(None)):
     require_admin(authorization)
-    users   = supabase.auth.admin.list_users()
+    users = supabase.auth.admin.list_users()
     total_users = len(users) if isinstance(users, list) else 0
-    bots    = supabase.table("bots").select("id", count="exact").execute()
-    subs    = supabase.table("subscriptions").select("plan").execute()
-    plan_counts = {"free": 0, "pro": 0, "business": 0}
-    for s in (subs.data or []):
-        p = s.get("plan", "free")
-        plan_counts[p] = plan_counts.get(p, 0) + 1
-    paid = plan_counts["pro"] + plan_counts["business"]
+    bots = supabase.table("bots").select("id", count="exact").execute()
+
+    # 付費用戶 = 有至少一筆 active bot_subscriptions 的用戶
+    bot_subs = supabase.table("bot_subscriptions").select("user_id").eq("status", "active").execute()
+    paid_user_ids = set(r["user_id"] for r in (bot_subs.data or []))
+    paid_users = len(paid_user_ids)
+
+    # 總 bot slots
+    all_subs = supabase.table("bot_subscriptions").select("slots").eq("status", "active").execute()
+    total_slots = sum(r.get("slots", 1) for r in (all_subs.data or []))
+
     return {
         "total_users": total_users,
         "total_bots":  bots.count or 0,
-        "paid_users":  paid,
-        "plan_counts": plan_counts,
+        "paid_users":  paid_users,
+        "total_slots": total_slots,
     }
 
 
@@ -1071,8 +1075,15 @@ async def admin_list_users(authorization: Optional[str] = Header(None)):
     users = supabase.auth.admin.list_users()
     user_list = users if isinstance(users, list) else []
 
-    subs_rows = supabase.table("subscriptions").select("*").execute()
-    subs_map  = {s["user_id"]: s for s in (subs_rows.data or [])}
+    # bot_subscriptions: 每個用戶的 active slots 總和
+    subs_rows = supabase.table("bot_subscriptions").select("user_id, slots, status, renews_at").eq("status", "active").execute()
+    slots_map: dict = {}
+    renews_map: dict = {}
+    for r in (subs_rows.data or []):
+        uid = r["user_id"]
+        slots_map[uid] = slots_map.get(uid, 0) + r.get("slots", 1)
+        if not renews_map.get(uid):
+            renews_map[uid] = r.get("renews_at")
 
     bots_rows = supabase.table("bots").select("user_id").execute()
     bot_count: dict = {}
@@ -1082,41 +1093,40 @@ async def admin_list_users(authorization: Optional[str] = Header(None)):
 
     result = []
     for u in user_list:
-        uid  = u.id
-        sub  = subs_map.get(uid, {})
+        uid = u.id
+        slots = slots_map.get(uid, 0)
         result.append({
             "user_id":    uid,
             "email":      u.email,
             "created_at": str(u.created_at),
-            "plan":       sub.get("plan", "free"),
-            "status":     sub.get("status", "active"),
-            "billing_cycle":      sub.get("billing_cycle"),
-            "current_period_end": sub.get("current_period_end"),
-            "bot_count":  bot_count.get(uid, 0),
+            "bot_slots":  slots,
+            "max_bots":   1 + slots,
+            "bots_used":  bot_count.get(uid, 0),
+            "renews_at":  renews_map.get(uid),
         })
 
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return result
 
 
-class AdminPlanUpdate(BaseModel):
-    plan: str           # 'free' | 'pro' | 'business'
-    billing_cycle: Optional[str] = None   # 'monthly' | 'annual' | None
+class AdminSlotsUpdate(BaseModel):
+    slots: int  # 0 = free only, 1 = 1 paid bot, 10 = business
 
 
-@app.patch("/admin/users/{target_user_id}/plan")
-async def admin_update_plan(
+@app.put("/admin/users/{target_user_id}/slots")
+async def admin_set_slots(
     target_user_id: str,
-    body: AdminPlanUpdate,
+    body: AdminSlotsUpdate,
     authorization: Optional[str] = Header(None),
 ):
     require_admin(authorization)
-    now = datetime.utcnow().isoformat()
-    supabase.table("subscriptions").upsert({
-        "user_id":       target_user_id,
-        "plan":          body.plan,
-        "billing_cycle": body.billing_cycle,
-        "status":        "active",
-        "updated_at":    now,
-    }, on_conflict="user_id").execute()
-    return {"ok": True, "user_id": target_user_id, "plan": body.plan}
+    # 刪除該用戶所有 admin_grant 類型的訂閱，重新建立
+    supabase.table("bot_subscriptions").delete().eq("user_id", target_user_id).eq("id", f"admin_{target_user_id}").execute()
+    if body.slots > 0:
+        supabase.table("bot_subscriptions").upsert({
+            "id":       f"admin_{target_user_id}",
+            "user_id":  target_user_id,
+            "status":   "active",
+            "slots":    body.slots,
+        }).execute()
+    return {"ok": True, "user_id": target_user_id, "slots": body.slots}
