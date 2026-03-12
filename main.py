@@ -105,6 +105,43 @@ def get_bot_slots(user_id: str) -> int:
     return sum(r.get("slots", 1) for r in (rows.data or []))
 
 
+FREE_MSG_LIMIT = 300
+
+def check_message_allowed(bot_id: str) -> tuple[bool, str]:
+    """
+    檢查此 bot 是否允許再收一則訊息。
+    回傳 (allowed: bool, reason: str)
+    """
+    bot_row = supabase.table("bots").select("user_id").eq("id", bot_id).execute()
+    if not bot_row.data:
+        return False, "Bot 不存在"
+
+    user_id = bot_row.data[0]["user_id"]
+    slots   = get_bot_slots(user_id)
+
+    # 找出此 bot 在該用戶所有 bot 中的排序（最舊優先）
+    all_bots = supabase.table("bots").select("id").eq("user_id", user_id).order("created_at").execute()
+    bot_ids  = [b["id"] for b in (all_bots.data or [])]
+    idx      = bot_ids.index(bot_id) if bot_id in bot_ids else len(bot_ids)
+    is_paid  = idx < slots  # 前 N 個 bot 為付費
+
+    if is_paid:
+        return True, ""
+
+    # 免費 bot：計算本月訊息數
+    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    count = supabase.table("conversations") \
+        .select("id", count="exact") \
+        .eq("bot_id", bot_id) \
+        .gte("created_at", month_start) \
+        .execute()
+
+    used = count.count or 0
+    if used >= FREE_MSG_LIMIT:
+        return False, f"免費方案已達每月 {FREE_MSG_LIMIT} 則訊息上限，請升級方案繼續使用。"
+    return True, ""
+
+
 @app.post("/bots")
 async def create_bot(
     name: str,
@@ -320,6 +357,10 @@ class ChatRequest(BaseModel):
 
 @app.post("/bots/{bot_id}/chat")
 async def chat(bot_id: str, body: ChatRequest):
+    allowed, reason = check_message_allowed(bot_id)
+    if not allowed:
+        return {"answer": reason}
+
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, "
         "calendar_id, slot_duration_minutes, business_hours, keyword_triggers"
@@ -392,6 +433,15 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
     session_id = f"line_{bot_id}_{user_id}"
 
     logging.info(f"[LINE] Processing buffered msgs for {user_id}: {combined_msg[:50]}")
+
+    # 免費方案訊息上限檢查
+    allowed, reason = check_message_allowed(bot_id)
+    if not allowed:
+        reply_token = buf.get("reply_token", "")
+        if reply_token:
+            bot_cfg = _get_bot_config(bot_id)
+            await reply_line_message(reply_token, reason, bot_cfg.get("anthropic_api_key", ""))
+        return
 
     try:
         bot = _get_bot_config(bot_id)
