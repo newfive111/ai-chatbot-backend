@@ -95,12 +95,32 @@ def get_user_id(authorization: str = None) -> str:
     payload = decode_token(token)
     return payload["user_id"]
 
+def get_bot_slots(user_id: str) -> int:
+    """回傳該用戶目前有效的付費 Bot 訂閱數量"""
+    rows = supabase.table("bot_subscriptions") \
+        .select("id", count="exact") \
+        .eq("user_id", user_id) \
+        .eq("status", "active") \
+        .execute()
+    return rows.count or 0
+
+
 @app.post("/bots")
 async def create_bot(
     name: str,
     authorization: Optional[str] = Header(None)
 ):
     user_id = get_user_id(authorization)
+
+    # 限制：免費 1 個，每個付費訂閱 +1
+    existing = supabase.table("bots").select("id", count="exact").eq("user_id", user_id).execute()
+    current_count = existing.count or 0
+    slots = get_bot_slots(user_id)
+    max_bots = 1 + slots  # 1 免費 + N 付費
+
+    if current_count >= max_bots:
+        raise HTTPException(403, f"已達上限（{max_bots} 個 Bot）。請至定價頁購買更多名額。")
+
     bot_id = generate_bot_id()
     supabase.table("bots").insert({
         "id": bot_id,
@@ -763,8 +783,8 @@ def _ls_headers():
 
 
 class CheckoutRequest(BaseModel):
-    plan: str          # 'pro' | 'business'
-    billing_cycle: str # 'monthly' | 'annual'
+    plan: str = "bot"           # 保留相容性，固定使用 bot 月訂閱
+    billing_cycle: str = "monthly"
 
 
 @app.post("/stripe/checkout")
@@ -772,15 +792,16 @@ async def create_checkout(
     body: CheckoutRequest,
     authorization: Optional[str] = Header(None),
 ):
-    """建立 Lemon Squeezy Checkout，前端 redirect 過去付款"""
+    """建立 Lemon Squeezy Checkout — 每個 Bot 1290/月"""
     user_id = get_user_id(authorization)
 
     if not LS_API_KEY:
         raise HTTPException(500, "Lemon Squeezy 尚未設定")
 
-    variant_id = VARIANT_MAP.get((body.plan, body.billing_cycle))
+    # 固定使用 Pro Monthly variant（1290 TWD/月）
+    variant_id = LS_VARIANT_PRO_MONTHLY
     if not variant_id:
-        raise HTTPException(400, f"無效的方案：{body.plan}/{body.billing_cycle}")
+        raise HTTPException(500, "Bot 訂閱方案尚未設定")
 
     # 取用戶 email
     try:
@@ -796,9 +817,7 @@ async def create_checkout(
                 "checkout_data": {
                     "email": email,
                     "custom": {
-                        "user_id":      user_id,
-                        "plan":         body.plan,
-                        "billing_cycle": body.billing_cycle,
+                        "user_id": user_id,
                     }
                 },
                 "checkout_options": {
@@ -847,73 +866,64 @@ async def ls_webhook(request: Request):
     logging.info(f"[LS] Webhook event: {etype}")
 
     if etype == "subscription_created":
-        user_id  = custom.get("user_id") or attrs.get("user_email")
-        plan     = custom.get("plan", "pro")
-        cycle    = custom.get("billing_cycle", "monthly")
-        sub_id   = str(data["data"]["id"])
-        cust_id  = str(attrs.get("customer_id", ""))
-        renews   = attrs.get("renews_at") or attrs.get("ends_at")
+        user_id = custom.get("user_id")
+        sub_id  = str(data["data"]["id"])
+        cust_id = str(attrs.get("customer_id", ""))
+        renews  = attrs.get("renews_at") or attrs.get("ends_at")
 
         if user_id:
-            supabase.table("subscriptions").upsert({
-                "user_id":                user_id,
-                "stripe_customer_id":     cust_id,
-                "stripe_subscription_id": sub_id,
-                "plan":                   plan,
-                "billing_cycle":          cycle,
-                "status":                 "active",
-                "current_period_end":     renews,
-                "updated_at":             datetime.utcnow().isoformat(),
-            }).execute()
-            logging.info(f"[LS] Subscribed: user={user_id[:8]} plan={plan}/{cycle}")
+            # 寫入 bot_subscriptions（每筆訂閱一列）
+            supabase.table("bot_subscriptions").upsert({
+                "id":         sub_id,
+                "user_id":    user_id,
+                "customer_id": cust_id,
+                "status":     "active",
+                "renews_at":  renews,
+                "created_at": datetime.utcnow().isoformat(),
+            }, on_conflict="id").execute()
+            logging.info(f"[LS] Bot sub created: user={user_id[:8]} sub={sub_id}")
 
     elif etype in ("subscription_cancelled", "subscription_expired"):
         sub_id = str(data["data"]["id"])
-        row = supabase.table("subscriptions").select("user_id").eq("stripe_subscription_id", sub_id).execute()
-        if row.data:
-            supabase.table("subscriptions").update({
-                "status":     "canceled",
-                "plan":       "free",
-                "updated_at": datetime.utcnow().isoformat(),
-            }).eq("stripe_subscription_id", sub_id).execute()
-            logging.info(f"[LS] Cancelled: sub={sub_id}")
+        supabase.table("bot_subscriptions").update({
+            "status":     "cancelled",
+        }).eq("id", sub_id).execute()
+        logging.info(f"[LS] Bot sub cancelled: sub={sub_id}")
 
     elif etype == "subscription_payment_failed":
         sub_id = str(attrs.get("subscription_id", ""))
         if sub_id:
-            supabase.table("subscriptions").update({
-                "status":     "past_due",
-                "updated_at": datetime.utcnow().isoformat(),
-            }).eq("stripe_subscription_id", sub_id).execute()
+            supabase.table("bot_subscriptions").update({
+                "status": "past_due",
+            }).eq("id", sub_id).execute()
             logging.info(f"[LS] Payment failed: sub={sub_id}")
 
     elif etype == "subscription_updated":
         sub_id = str(data["data"]["id"])
         status = attrs.get("status", "active")
         renews = attrs.get("renews_at") or attrs.get("ends_at")
-        update = {"status": status, "updated_at": datetime.utcnow().isoformat()}
+        update: dict = {"status": status}
         if renews:
-            update["current_period_end"] = renews
+            update["renews_at"] = renews
         if status in ("cancelled", "expired"):
-            update["plan"] = "free"
-        supabase.table("subscriptions").update(update).eq("stripe_subscription_id", sub_id).execute()
+            update["status"] = "cancelled"
+        supabase.table("bot_subscriptions").update(update).eq("id", sub_id).execute()
 
     return {"received": True}
 
 
 @app.get("/me/subscription")
 async def get_subscription(authorization: Optional[str] = Header(None)):
-    """取得目前用戶的訂閱狀態"""
-    user_id = get_user_id(authorization)
-    row = supabase.table("subscriptions").select("*").eq("user_id", user_id).execute()
-    if not row.data:
-        return {"plan": "free", "status": "active", "billing_cycle": None, "current_period_end": None}
-    s = row.data[0]
+    """取得目前用戶的訂閱狀態（per-bot 模型）"""
+    user_id   = get_user_id(authorization)
+    slots     = get_bot_slots(user_id)
+    bots_used = (supabase.table("bots").select("id", count="exact").eq("user_id", user_id).execute().count or 0)
     return {
-        "plan":               s.get("plan", "free"),
-        "status":             s.get("status", "active"),
-        "billing_cycle":      s.get("billing_cycle"),
-        "current_period_end": s.get("current_period_end"),
+        "plan":      "paid" if slots > 0 else "free",
+        "bot_slots": slots,
+        "max_bots":  1 + slots,
+        "bots_used": bots_used,
+        "status":    "active",
     }
 
 
