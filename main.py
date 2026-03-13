@@ -925,6 +925,18 @@ async def create_checkout(
     return {"checkout_url": checkout_url}
 
 
+@app.get("/debug/ls-variants")
+async def debug_ls_variants(authorization: Optional[str] = Header(None)):
+    """臨時 debug：列出 LS store 所有 variants"""
+    require_admin(authorization)
+    async with _httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{LS_BASE}/variants?filter[store_id]={LS_STORE_ID}&page[size]=50",
+            headers=_ls_headers(), timeout=15
+        )
+        return {"status": r.status_code, "data": r.json()}
+
+
 @app.post("/stripe/webhook")
 async def ls_webhook(request: Request):
     """Lemon Squeezy Webhook：訂閱建立 / 取消 / 付款失敗"""
