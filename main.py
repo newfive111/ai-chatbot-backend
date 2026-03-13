@@ -917,8 +917,9 @@ async def create_checkout(
     async with _httpx.AsyncClient() as client:
         r = await client.post(f"{LS_BASE}/checkouts", json=payload, headers=_ls_headers(), timeout=15)
         if r.status_code not in (200, 201):
-            logging.error(f"[LS] Checkout error {r.status_code}: {r.text[:200]}")
-            raise HTTPException(502, "建立付款連結失敗，請稍後再試")
+            err_detail = r.text[:300]
+            logging.error(f"[LS] Checkout error {r.status_code}: {err_detail}")
+            raise HTTPException(502, f"建立付款連結失敗 ({r.status_code}): {err_detail}")
         checkout_url = r.json()["data"]["attributes"]["url"]
 
     return {"checkout_url": checkout_url}
