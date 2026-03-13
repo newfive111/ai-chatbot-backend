@@ -925,16 +925,18 @@ async def create_checkout(
     return {"checkout_url": checkout_url}
 
 
-@app.get("/debug/ls-variant/{variant_id}")
-async def debug_ls_variant(variant_id: str, authorization: Optional[str] = Header(None)):
-    """臨時 debug：查詢特定 variant"""
+@app.get("/debug/ls-config")
+async def debug_ls_config(authorization: Optional[str] = Header(None)):
+    """臨時 debug：顯示 LS 設定值"""
     require_admin(authorization)
-    async with _httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{LS_BASE}/variants/{variant_id}",
-            headers=_ls_headers(), timeout=15
-        )
-        return {"status": r.status_code, "body": r.text[:500]}
+    return {
+        "store_id": LS_STORE_ID,
+        "bot_monthly": LS_VARIANT_BOT_MONTHLY,
+        "bot_annual": LS_VARIANT_BOT_ANNUAL,
+        "business_monthly": LS_VARIANT_BUSINESS_MONTHLY,
+        "business_annual": LS_VARIANT_BUSINESS_ANNUAL,
+        "api_key_prefix": LS_API_KEY[:8] if LS_API_KEY else "NOT SET",
+    }
 
 
 @app.post("/stripe/webhook")
