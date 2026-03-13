@@ -97,12 +97,15 @@ def get_user_id(authorization: str = None) -> str:
 
 def get_bot_slots(user_id: str) -> int:
     """回傳該用戶目前有效的付費 Bot 名額總數（商業版=10, 單Bot=1）"""
-    rows = supabase.table("bot_subscriptions") \
-        .select("slots") \
-        .eq("user_id", user_id) \
-        .eq("status", "active") \
-        .execute()
-    return sum(r.get("slots", 1) for r in (rows.data or []))
+    try:
+        rows = supabase.table("bot_subscriptions") \
+            .select("slots") \
+            .eq("user_id", user_id) \
+            .eq("status", "active") \
+            .execute()
+        return sum(r.get("slots", 1) for r in (rows.data or []))
+    except Exception:
+        return 0
 
 
 def is_bot_paid(bot_id: str) -> bool:
