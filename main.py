@@ -925,16 +925,16 @@ async def create_checkout(
     return {"checkout_url": checkout_url}
 
 
-@app.get("/debug/ls-variants")
-async def debug_ls_variants(authorization: Optional[str] = Header(None)):
-    """臨時 debug：列出 LS store 所有 variants"""
+@app.get("/debug/ls-variant/{variant_id}")
+async def debug_ls_variant(variant_id: str, authorization: Optional[str] = Header(None)):
+    """臨時 debug：查詢特定 variant"""
     require_admin(authorization)
     async with _httpx.AsyncClient() as client:
         r = await client.get(
-            f"{LS_BASE}/variants?filter[store_id]={LS_STORE_ID}&page[size]=50",
+            f"{LS_BASE}/variants/{variant_id}",
             headers=_ls_headers(), timeout=15
         )
-        return {"status": r.status_code, "data": r.json()}
+        return {"status": r.status_code, "body": r.text[:500]}
 
 
 @app.post("/stripe/webhook")
