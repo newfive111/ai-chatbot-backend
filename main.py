@@ -1129,13 +1129,15 @@ async def admin_set_slots(
     authorization: Optional[str] = Header(None),
 ):
     require_admin(authorization)
-    # 刪除該用戶所有 admin_grant 類型的訂閱，重新建立
-    supabase.table("bot_subscriptions").delete().eq("user_id", target_user_id).eq("id", f"admin_{target_user_id}").execute()
-    if body.slots > 0:
-        supabase.table("bot_subscriptions").upsert({
-            "id":       f"admin_{target_user_id}",
-            "user_id":  target_user_id,
-            "status":   "active",
-            "slots":    body.slots,
-        }).execute()
+    try:
+        supabase.table("bot_subscriptions").delete().eq("id", f"admin_{target_user_id}").execute()
+        if body.slots > 0:
+            supabase.table("bot_subscriptions").upsert({
+                "id":       f"admin_{target_user_id}",
+                "user_id":  target_user_id,
+                "status":   "active",
+                "slots":    body.slots,
+            }).execute()
+    except Exception as e:
+        raise HTTPException(500, f"DB 寫入失敗：{str(e)}")
     return {"ok": True, "user_id": target_user_id, "slots": body.slots}
