@@ -1056,13 +1056,15 @@ async def admin_stats(authorization: Optional[str] = Header(None)):
     bots = supabase.table("bots").select("id", count="exact").execute()
 
     # 付費用戶 = 有至少一筆 active bot_subscriptions 的用戶
-    bot_subs = supabase.table("bot_subscriptions").select("user_id").eq("status", "active").execute()
-    paid_user_ids = set(r["user_id"] for r in (bot_subs.data or []))
-    paid_users = len(paid_user_ids)
-
-    # 總 bot slots
-    all_subs = supabase.table("bot_subscriptions").select("slots").eq("status", "active").execute()
-    total_slots = sum(r.get("slots", 1) for r in (all_subs.data or []))
+    try:
+        bot_subs = supabase.table("bot_subscriptions").select("user_id").eq("status", "active").execute()
+        paid_user_ids = set(r["user_id"] for r in (bot_subs.data or []))
+        paid_users = len(paid_user_ids)
+        all_subs = supabase.table("bot_subscriptions").select("slots").eq("status", "active").execute()
+        total_slots = sum(r.get("slots", 1) for r in (all_subs.data or []))
+    except Exception:
+        paid_users = 0
+        total_slots = 0
 
     return {
         "total_users": total_users,
@@ -1079,14 +1081,17 @@ async def admin_list_users(authorization: Optional[str] = Header(None)):
     user_list = users if isinstance(users, list) else []
 
     # bot_subscriptions: 每個用戶的 active slots 總和
-    subs_rows = supabase.table("bot_subscriptions").select("user_id, slots, status, renews_at").eq("status", "active").execute()
     slots_map: dict = {}
     renews_map: dict = {}
-    for r in (subs_rows.data or []):
-        uid = r["user_id"]
-        slots_map[uid] = slots_map.get(uid, 0) + r.get("slots", 1)
-        if not renews_map.get(uid):
-            renews_map[uid] = r.get("renews_at")
+    try:
+        subs_rows = supabase.table("bot_subscriptions").select("user_id, slots, status, renews_at").eq("status", "active").execute()
+        for r in (subs_rows.data or []):
+            uid = r["user_id"]
+            slots_map[uid] = slots_map.get(uid, 0) + r.get("slots", 1)
+            if not renews_map.get(uid):
+                renews_map[uid] = r.get("renews_at")
+    except Exception:
+        pass
 
     bots_rows = supabase.table("bots").select("user_id").execute()
     bot_count: dict = {}
