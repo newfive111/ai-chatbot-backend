@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import Optional, Set, Dict
 from datetime import datetime, timedelta
 import json
+import time
 import uuid
 import asyncio
 import logging
@@ -65,7 +66,8 @@ async def register(body: RegisterRequest):
         "email_confirm": True
     })
     if result.user:
-        token = create_token(result.user.id)
+        created_at_str = result.user.created_at.isoformat() if result.user.created_at else ""
+        token = create_token(result.user.id, email=result.user.email or "", created_at=created_at_str)
         return {"token": token, "user_id": result.user.id}
     raise HTTPException(400, "註冊失敗")
 
@@ -77,7 +79,8 @@ async def login(body: LoginRequest):
             "password": body.password
         })
         if result.user:
-            token = create_token(result.user.id)
+            created_at_str = result.user.created_at.isoformat() if result.user.created_at else ""
+            token = create_token(result.user.id, email=result.user.email or "", created_at=created_at_str)
             return {"token": token, "user_id": result.user.id}
     except Exception as e:
         raise HTTPException(401, f"帳號或密碼錯誤: {str(e)}")
@@ -436,7 +439,8 @@ def _get_bot_config(bot_id: str) -> dict:
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, "
         "line_channel_secret, line_channel_access_token, "
-        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds"
+        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds, "
+        "instagram_page_token"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
@@ -748,7 +752,7 @@ async def instagram_webhook_verify(
 
 @app.post("/instagram/webhook/{bot_id}")
 async def instagram_webhook(bot_id: str, request: Request):
-    """接收 Instagram DM，呼叫 AI 回覆"""
+    """接收 Instagram DM 與貼文留言，呼叫 AI 回覆"""
     data = await request.json()
 
     # Meta 驗證 ping
@@ -756,6 +760,7 @@ async def instagram_webhook(bot_id: str, request: Request):
         return {"status": "ignored"}
 
     for entry in data.get("entry", []):
+        # ── DM 事件（messaging）──
         for event in entry.get("messaging", []):
             sender_id = event.get("sender", {}).get("id")
             msg       = event.get("message", {})
@@ -765,8 +770,24 @@ async def instagram_webhook(bot_id: str, request: Request):
             if not text or msg.get("is_echo"):
                 continue
 
-            logging.info(f"[Instagram] bot={bot_id[:8]} sender={sender_id} msg={text[:50]}")
+            logging.info(f"[Instagram] DM bot={bot_id[:8]} sender={sender_id} msg={text[:50]}")
             asyncio.create_task(_process_instagram_message(bot_id, sender_id, text))
+
+        # ── 留言事件（changes/feed）──
+        for change in entry.get("changes", []):
+            if change.get("field") != "feed":
+                continue
+            value = change.get("value", {})
+            # 只處理新增留言（verb=add）、item=comment
+            if value.get("item") != "comment" or value.get("verb") not in ("add",):
+                continue
+            comment_id   = value.get("comment_id") or value.get("id")
+            text         = value.get("message", "").strip()
+            commenter_id = value.get("from", {}).get("id", "")
+            if not comment_id or not text:
+                continue
+            logging.info(f"[Instagram] Comment bot={bot_id[:8]} comment={comment_id} msg={text[:50]}")
+            asyncio.create_task(_process_instagram_comment(bot_id, comment_id, commenter_id, text))
 
     return {"status": "ok"}
 
@@ -822,40 +843,94 @@ async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
         logging.error(f"[Instagram] process error: {e}")
 
 
+async def _process_instagram_comment(bot_id: str, comment_id: str, commenter_id: str, text: str):
+    """非同步處理 Instagram 貼文留言，回覆 AI 答案"""
+    try:
+        bot = _get_bot_config(bot_id)
+        page_token = bot.get("instagram_page_token")
+        if not page_token:
+            logging.warning(f"[Instagram] bot {bot_id[:8]} has no page_token, skipping comment")
+            return
+
+        bot_name         = bot.get("name", "AI 助理")
+        api_key          = bot.get("anthropic_api_key")
+        sheet_id         = bot.get("sheet_id")
+        collect_fields   = bot.get("collect_fields") or []
+        system_prompt    = bot.get("system_prompt") or None
+        calendar_id      = bot.get("calendar_id") or None
+        slot_duration    = bot.get("slot_duration_minutes") or 60
+        business_hours   = bot.get("business_hours") or None
+        keyword_triggers = bot.get("keyword_triggers") or None
+        # 用 commenter_id 保持對話記憶（每位留言者獨立 session）
+        session_id       = f"ig_cmt_{bot_id}_{commenter_id}"
+
+        try:
+            answer = generate_answer(
+                bot_id, text, bot_name,
+                api_key=api_key,
+                collect_fields=collect_fields if collect_fields else None,
+                sheet_id=sheet_id,
+                session_id=session_id,
+                custom_system_prompt=system_prompt,
+                calendar_id=calendar_id,
+                slot_duration_minutes=slot_duration,
+                business_hours=business_hours,
+                keyword_triggers=keyword_triggers,
+            )
+        except Exception as e:
+            if "NO_API_KEY" in str(e):
+                answer = "⚠️ 此 Bot 尚未設定 Gemini API Key，暫時無法回應。"
+            else:
+                raise
+
+        from app.instagram.webhook import reply_instagram_comment
+        status = await reply_instagram_comment(comment_id, answer, page_token)
+        logging.info(f"[Instagram] Replied to comment {comment_id}, status={status}")
+
+        supabase.table("conversations").insert({
+            "bot_id": bot_id, "question": text, "answer": answer
+        }).execute()
+
+    except Exception as e:
+        logging.error(f"[Instagram] comment process error: {e}")
+
+
 # ──────────────────────────────────────
-# Lemon Squeezy 付費整合
+# 藍新金流（NewebPay）付費整合
 # ──────────────────────────────────────
 
-import hmac
-import hashlib
-import httpx as _httpx
+import random
+import string
 
 from app.config import (
-    LS_API_KEY, LS_WEBHOOK_SECRET, LS_STORE_ID,
-    LS_VARIANT_BOT_MONTHLY, LS_VARIANT_BOT_ANNUAL,
-    LS_VARIANT_BUSINESS_MONTHLY, LS_VARIANT_BUSINESS_ANNUAL,
+    NEWEBPAY_MERCHANT_ID, NEWEBPAY_HASH_KEY, NEWEBPAY_HASH_IV, NEWEBPAY_SANDBOX,
+    PRICE_BOT_MONTHLY, PRICE_BOT_ANNUAL,
+    PRICE_BUSINESS_MONTHLY, PRICE_BUSINESS_ANNUAL,
 )
+from app.newebpay.payment import build_checkout_params, parse_notify
 
-LS_BASE = "https://api.lemonsqueezy.com/v1"
+def _plan_to_slots(plan: str) -> int:
+    return 10 if plan == "business" else 1
 
-# variant_id → bot slots 數量（module load 後才能建，用 lambda 延遲）
-def _get_variant_slots() -> dict:
-    return {
-        LS_VARIANT_BOT_MONTHLY:      1,
-        LS_VARIANT_BOT_ANNUAL:       1,
-        LS_VARIANT_BUSINESS_MONTHLY: 10,
-        LS_VARIANT_BUSINESS_ANNUAL:  10,
-    }
+def _plan_to_amount(plan: str, annual: bool) -> int:
+    if plan == "business":
+        return PRICE_BUSINESS_ANNUAL if annual else PRICE_BUSINESS_MONTHLY
+    return PRICE_BOT_ANNUAL if annual else PRICE_BOT_MONTHLY
 
-def _variant_to_slots(variant_id: str) -> int:
-    return _get_variant_slots().get(variant_id, 1)
+def _plan_to_desc(plan: str, annual: bool) -> str:
+    cycle = "年付" if annual else "月付"
+    name  = "商業版" if plan == "business" else "Bot 訂閱"
+    return f"攬得回 {name}（{cycle}）"
 
-def _ls_headers():
-    return {"Authorization": f"Bearer {LS_API_KEY}", "Accept": "application/vnd.api+json", "Content-Type": "application/vnd.api+json"}
+def _make_order_no(user_id: str) -> str:
+    """產生藍新訂單號（max 20 chars）：NP + 10位時間戳 + 8位user前綴"""
+    ts     = str(int(time.time()))
+    prefix = user_id.replace("-", "")[:8]
+    return f"NP{ts}{prefix}"[:20]
 
 
 class CheckoutRequest(BaseModel):
-    plan: str = "bot"            # "bot" | "business"
+    plan: str = "bot"               # "bot" | "business"
     billing_cycle: str = "monthly"  # "monthly" | "annual"
 
 
@@ -864,22 +939,10 @@ async def create_checkout(
     body: CheckoutRequest,
     authorization: Optional[str] = Header(None),
 ):
-    """建立 Lemon Squeezy Checkout"""
+    """建立藍新金流付款參數（前端表單 POST）"""
     user_id = get_user_id(authorization)
-
-    if not LS_API_KEY:
-        raise HTTPException(500, "Lemon Squeezy 尚未設定")
-
-    annual = body.billing_cycle == "annual"
-
-    if body.plan == "business":
-        variant_id = LS_VARIANT_BUSINESS_ANNUAL if annual else LS_VARIANT_BUSINESS_MONTHLY
-        if not variant_id:
-            raise HTTPException(500, "商業版方案尚未設定")
-    else:
-        variant_id = LS_VARIANT_BOT_ANNUAL if annual else LS_VARIANT_BOT_MONTHLY
-        if not variant_id:
-            raise HTTPException(500, "Bot 訂閱方案尚未設定")
+    annual  = body.billing_cycle == "annual"
+    plan    = body.plan if body.plan in ("bot", "business") else "bot"
 
     # 取用戶 email
     try:
@@ -888,123 +951,83 @@ async def create_checkout(
     except Exception:
         email = ""
 
-    payload = {
-        "data": {
-            "type": "checkouts",
-            "attributes": {
-                "checkout_data": {
-                    "email": email,
-                    "custom": {
-                        "user_id": user_id,
-                    }
-                },
-                "checkout_options": {
-                    "embed": False,
-                    "media": False,
-                },
-                "product_options": {
-                    "redirect_url":    "https://landehui.online/dashboard?payment=success",
-                    "receipt_link_url": "https://landehui.online/dashboard",
-                },
-            },
-            "relationships": {
-                "store":   {"data": {"type": "stores",   "id": str(LS_STORE_ID)}},
-                "variant": {"data": {"type": "variants", "id": str(variant_id)}},
-            }
-        }
-    }
+    amount   = _plan_to_amount(plan, annual)
+    order_no = _make_order_no(user_id)
+    item_desc = _plan_to_desc(plan, annual)
+    slots    = _plan_to_slots(plan)
 
-    async with _httpx.AsyncClient() as client:
-        r = await client.post(f"{LS_BASE}/checkouts", json=payload, headers=_ls_headers(), timeout=15)
-        if r.status_code not in (200, 201):
-            err_detail = r.text[:300]
-            logging.error(f"[LS] Checkout error {r.status_code}: {err_detail}")
-            raise HTTPException(502, f"建立付款連結失敗 ({r.status_code}): {err_detail}")
-        checkout_url = r.json()["data"]["attributes"]["url"]
+    # 暫存訂單（等 webhook 回來時找回 user_id + plan）
+    renews_at = (
+        (datetime.utcnow() + timedelta(days=365)).isoformat()
+        if annual else
+        (datetime.utcnow() + timedelta(days=31)).isoformat()
+    )
+    supabase.table("orders").upsert({
+        "id":           order_no,
+        "user_id":      user_id,
+        "plan":         plan,
+        "billing_cycle": body.billing_cycle,
+        "amount":       amount,
+        "slots":        slots,
+        "renews_at":    renews_at,
+        "status":       "pending",
+        "created_at":   datetime.utcnow().isoformat(),
+    }, on_conflict="id").execute()
 
-    return {"checkout_url": checkout_url}
-
-
-@app.get("/debug/ls-config")
-async def debug_ls_config(authorization: Optional[str] = Header(None)):
-    """臨時 debug：顯示 LS 設定值"""
-    require_admin(authorization)
-    return {
-        "store_id": LS_STORE_ID,
-        "bot_monthly": LS_VARIANT_BOT_MONTHLY,
-        "bot_annual": LS_VARIANT_BOT_ANNUAL,
-        "business_monthly": LS_VARIANT_BUSINESS_MONTHLY,
-        "business_annual": LS_VARIANT_BUSINESS_ANNUAL,
-        "api_key_prefix": LS_API_KEY[:8] if LS_API_KEY else "NOT SET",
-    }
+    params = build_checkout_params(
+        merchant_id = NEWEBPAY_MERCHANT_ID,
+        hash_key    = NEWEBPAY_HASH_KEY,
+        hash_iv     = NEWEBPAY_HASH_IV,
+        order_no    = order_no,
+        amount      = amount,
+        item_desc   = item_desc,
+        email       = email,
+        return_url  = "https://landehui.online/dashboard?payment=success",
+        notify_url  = "https://api.landehui.online/newebpay/webhook",
+        sandbox     = NEWEBPAY_SANDBOX,
+    )
+    return params
 
 
-@app.post("/stripe/webhook")
-async def ls_webhook(request: Request):
-    """Lemon Squeezy Webhook：訂閱建立 / 取消 / 付款失敗"""
-    payload    = await request.body()
-    sig_header = request.headers.get("X-Signature", "")
+@app.post("/newebpay/webhook")
+async def newebpay_webhook(request: Request):
+    """藍新金流付款通知 Webhook"""
+    form   = await request.form()
+    result = parse_notify(dict(form), NEWEBPAY_HASH_KEY, NEWEBPAY_HASH_IV)
 
-    # 驗簽名
-    if LS_WEBHOOK_SECRET:
-        expected = hmac.new(LS_WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, sig_header):
-            raise HTTPException(400, "Webhook 簽名驗證失敗")
+    if not result:
+        logging.warning("[NewebPay] Webhook ignored (invalid / non-success)")
+        return {"status": "ignored"}
 
-    data  = json.loads(payload)
-    etype = data.get("meta", {}).get("event_name", "")
-    attrs = data.get("data", {}).get("attributes", {})
-    custom = data.get("meta", {}).get("custom_data", {})
+    order_no = result.get("MerOrderNo", "")
+    logging.info(f"[NewebPay] Payment success: order={order_no}")
 
-    logging.info(f"[LS] Webhook event: {etype}")
+    # 查訂單 → 找回 user_id / plan / slots
+    row = supabase.table("orders").select("*").eq("id", order_no).execute()
+    if not row.data:
+        logging.error(f"[NewebPay] Order not found: {order_no}")
+        return {"status": "order_not_found"}
 
-    if etype == "subscription_created":
-        user_id    = custom.get("user_id")
-        sub_id     = str(data["data"]["id"])
-        cust_id    = str(attrs.get("customer_id", ""))
-        renews     = attrs.get("renews_at") or attrs.get("ends_at")
-        variant_id = str(attrs.get("variant_id", ""))
-        slots      = _variant_to_slots(variant_id)
+    order    = row.data[0]
+    user_id  = order["user_id"]
+    slots    = order.get("slots", 1)
+    renews_at = order.get("renews_at")
 
-        if user_id:
-            supabase.table("bot_subscriptions").upsert({
-                "id":          sub_id,
-                "user_id":     user_id,
-                "customer_id": cust_id,
-                "status":      "active",
-                "slots":       slots,
-                "renews_at":   renews,
-                "created_at":  datetime.utcnow().isoformat(),
-            }, on_conflict="id").execute()
-            logging.info(f"[LS] Sub created: user={user_id[:8]} slots={slots} sub={sub_id}")
+    # 更新訂單狀態
+    supabase.table("orders").update({"status": "paid"}).eq("id", order_no).execute()
 
-    elif etype in ("subscription_cancelled", "subscription_expired"):
-        sub_id = str(data["data"]["id"])
-        supabase.table("bot_subscriptions").update({
-            "status":     "cancelled",
-        }).eq("id", sub_id).execute()
-        logging.info(f"[LS] Bot sub cancelled: sub={sub_id}")
+    # 寫入 bot_subscriptions（訂閱生效）
+    supabase.table("bot_subscriptions").upsert({
+        "id":         order_no,
+        "user_id":    user_id,
+        "status":     "active",
+        "slots":      slots,
+        "renews_at":  renews_at,
+        "created_at": datetime.utcnow().isoformat(),
+    }, on_conflict="id").execute()
 
-    elif etype == "subscription_payment_failed":
-        sub_id = str(attrs.get("subscription_id", ""))
-        if sub_id:
-            supabase.table("bot_subscriptions").update({
-                "status": "past_due",
-            }).eq("id", sub_id).execute()
-            logging.info(f"[LS] Payment failed: sub={sub_id}")
-
-    elif etype == "subscription_updated":
-        sub_id = str(data["data"]["id"])
-        status = attrs.get("status", "active")
-        renews = attrs.get("renews_at") or attrs.get("ends_at")
-        update: dict = {"status": status}
-        if renews:
-            update["renews_at"] = renews
-        if status in ("cancelled", "expired"):
-            update["status"] = "cancelled"
-        supabase.table("bot_subscriptions").update(update).eq("id", sub_id).execute()
-
-    return {"received": True}
+    logging.info(f"[NewebPay] Sub activated: user={user_id[:8]} slots={slots}")
+    return {"status": "ok"}
 
 
 @app.get("/me/subscription")
@@ -1022,26 +1045,68 @@ async def get_subscription(authorization: Optional[str] = Header(None)):
     }
 
 
-@app.post("/stripe/portal")
-async def ls_portal(authorization: Optional[str] = Header(None)):
-    """取得 Lemon Squeezy Customer Portal URL"""
+@app.get("/me/profile")
+async def get_profile(authorization: Optional[str] = Header(None)):
+    """會員中心：帳號資訊 + 訂閱狀態"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "未授權")
+    token = authorization.replace("Bearer ", "")
+    payload = decode_token(token)
+    user_id    = payload["user_id"]
+    email      = payload.get("email", "")
+    created_at = payload.get("created_at") or None
+
+    # 訂閱狀態
+    slots     = get_bot_slots(user_id)
+    bots_used = (supabase.table("bots").select("id", count="exact").eq("user_id", user_id).execute().count or 0)
+
+    # 最近一筆有效訂閱的到期日
+    renews_at = None
+    try:
+        sub_row = supabase.table("bot_subscriptions").select("renews_at").eq("user_id", user_id).eq("status", "active").order("renews_at", desc=True).limit(1).execute()
+        if sub_row.data:
+            renews_at = sub_row.data[0].get("renews_at")
+    except Exception:
+        pass
+
+    return {
+        "email":      email,
+        "created_at": created_at,
+        "plan":       "paid" if slots > 0 else "free",
+        "bot_slots":  slots,
+        "bots_used":  bots_used,
+        "renews_at":  renews_at,
+    }
+
+
+@app.get("/me/orders")
+async def get_orders(authorization: Optional[str] = Header(None)):
+    """會員中心：付款紀錄"""
     user_id = get_user_id(authorization)
+    try:
+        rows = supabase.table("orders").select("id, plan, billing_cycle, amount, status, created_at").eq("user_id", user_id).eq("status", "paid").order("created_at", desc=True).limit(20).execute()
+        return rows.data or []
+    except Exception:
+        return []
 
-    row = supabase.table("subscriptions").select("stripe_customer_id").eq("user_id", user_id).execute()
-    if not row.data or not row.data[0].get("stripe_customer_id"):
-        raise HTTPException(404, "找不到訂閱資料")
 
-    cust_id = row.data[0]["stripe_customer_id"]
-    async with _httpx.AsyncClient() as client:
-        r = await client.get(f"{LS_BASE}/customers/{cust_id}", headers=_ls_headers(), timeout=10)
-        if r.status_code != 200:
-            raise HTTPException(502, "無法取得客戶資料")
-        portal_url = r.json()["data"]["attributes"].get("urls", {}).get("customer_portal")
+class ChangePasswordRequest(BaseModel):
+    new_password: str
 
-    if not portal_url:
-        raise HTTPException(404, "找不到管理頁面連結")
-
-    return {"portal_url": portal_url}
+@app.post("/me/change-password")
+async def change_password(
+    body: ChangePasswordRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """會員中心：修改密碼"""
+    user_id = get_user_id(authorization)
+    if len(body.new_password) < 8:
+        raise HTTPException(400, "密碼至少需要 8 個字元")
+    try:
+        supabase.auth.admin.update_user_by_id(user_id, {"password": body.new_password})
+        return {"message": "密碼已更新"}
+    except Exception as e:
+        raise HTTPException(500, f"更新密碼失敗：{str(e)}")
 
 
 @app.get("/")

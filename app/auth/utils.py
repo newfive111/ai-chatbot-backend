@@ -5,9 +5,11 @@ from fastapi import HTTPException
 from app.config import JWT_SECRET
 
 
-def create_token(user_id: str) -> str:
+def create_token(user_id: str, email: str = "", created_at: str = "") -> str:
     payload = {
         "user_id": user_id,
+        "email": email,
+        "created_at": created_at,
         "exp": datetime.utcnow() + timedelta(days=30)
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
