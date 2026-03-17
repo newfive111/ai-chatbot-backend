@@ -368,9 +368,9 @@ async def chat(bot_id: str, body: ChatRequest):
     if not is_bot_paid(bot_id):
         return {"answer": "此 Bot 為免費方案，不支援網站嵌入功能。請升級方案後使用，或透過 LINE 試用。"}
 
-    allowed, reason = check_message_allowed(bot_id)
+    allowed, _ = check_message_allowed(bot_id)
     if not allowed:
-        return {"answer": reason}
+        return {"answer": ""}
 
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, "
@@ -446,13 +446,9 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
 
     logging.info(f"[LINE] Processing buffered msgs for {user_id}: {combined_msg[:50]}")
 
-    # 免費方案訊息上限檢查
-    allowed, reason = check_message_allowed(bot_id)
+    # 訂閱檢查：未付費直接靜默，不回覆任何訊息
+    allowed, _ = check_message_allowed(bot_id)
     if not allowed:
-        reply_token = buf.get("reply_token", "")
-        if reply_token:
-            bot_cfg = _get_bot_config(bot_id)
-            await reply_line_message(reply_token, reason, bot_cfg.get("anthropic_api_key", ""))
         return
 
     try:
