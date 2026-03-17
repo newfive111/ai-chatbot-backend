@@ -282,7 +282,16 @@ def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_ke
             logging.error(f"[Assistant] Gemini API error: {e}")
             return f"⚠️ AI 服務暫時無法連線，請稍後再試。（{str(e)[:60]}）"
 
+        if not response.candidates:
+            logging.error(f"[Assistant] Empty candidates from Gemini, prompt_feedback={getattr(response, 'prompt_feedback', None)}")
+            return "⚠️ AI 回應被過濾或配額不足，請稍後再試。"
+
         candidate = response.candidates[0]
+        if not candidate.content or not candidate.content.parts:
+            finish = getattr(candidate, "finish_reason", "unknown")
+            logging.error(f"[Assistant] No content in candidate, finish_reason={finish}")
+            return "⚠️ AI 回應為空，請稍後再試。"
+
         contents.append(candidate.content)
 
         # 找出 function_call parts
