@@ -230,6 +230,30 @@ def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_ke
     session = session_store.get_or_create(session_id)
     history: list = session.get("history", [])
 
+    # ── 自動確認：若有暫存 prompt 且用戶說確認，直接套用不靠 Gemini ──
+    _CONFIRM_KW = {"確認", "可以", "套用", "好的", "沒問題", "ok", "yes", "行", "好"}
+    _CANCEL_KW  = {"取消", "不要", "不用", "算了", "cancel", "no"}
+    staged = session.get("staged_prompt")
+    msg_stripped = user_message.strip().lower()
+
+    if staged:
+        if any(kw in user_message for kw in _CONFIRM_KW):
+            _save_snapshot(bot_id)
+            _sb.table("bots").update({"system_prompt": staged}).eq("id", bot_id).execute()
+            session.pop("staged_prompt", None)
+            history.append({"role": "user",      "content": user_message})
+            history.append({"role": "assistant",  "content": "✅ 角色設定已套用！建議到「測試對話」確認效果。"})
+            session["history"] = history
+            session_store.save(session_id, session)
+            return "✅ 角色設定已套用！建議到「測試對話」確認效果。"
+        elif any(kw in user_message for kw in _CANCEL_KW):
+            session.pop("staged_prompt", None)
+            history.append({"role": "user",      "content": user_message})
+            history.append({"role": "assistant",  "content": "已取消，設定不變。有需要可以隨時重新告訴我要怎麼改。"})
+            session["history"] = history
+            session_store.save(session_id, session)
+            return "已取消，設定不變。有需要可以隨時重新告訴我要怎麼改。"
+
     # 組 contents（多輪對話）
     contents: list[types.Content] = []
     for msg in history:
