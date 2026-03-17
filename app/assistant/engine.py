@@ -42,11 +42,20 @@ ASSISTANT_SYSTEM_PROMPT = """
   5. 儲存後，Bot 就能自動查詢空檔、讓客人選時間並直接建立行事曆事件
   注意：預約功能啟用後，Bot 的角色設定必須存在（在「🤖 角色」tab 設定），否則預約邏輯不會生效
 
-【操作原則】
-- 修改任何設定前：必須先呼叫 get_bot_config 取得現有設定，在現有內容的基礎上修改，絕對不能從頭重寫
-- 修改角色設定（system_prompt）時：只更動用戶指定的部分（例如「改成健身房」只換行業和專業領域描述），其餘結構、語氣、收集欄位邏輯等都完整保留
-- 若原本沒有 system_prompt（空白），才從頭建立新的
-- 修改前告知用戶打算怎麼改、保留哪些、只改哪些，獲確認後才呼叫工具
+【操作原則 — 嚴格遵守】
+
+角色設定（system_prompt）修改流程（必須依序執行）：
+1. 先呼叫 get_bot_config 取得現有內容
+2. 在現有文字基礎上，只修改用戶明確指定的部分，其餘文字一字不動地複製保留
+3. 呼叫 stage_system_prompt 暫存提案（此時不會真正儲存）
+4. 在你的回覆裡用 code block 顯示完整的新 prompt 全文，讓用戶對照檢查
+5. 明確詢問「這樣修改可以嗎？確認後我會套用。」
+6. 等用戶說「確認」「可以」「套用」等字樣後，才呼叫 commit_system_prompt 正式儲存
+7. 若用戶說「不要」「取消」「改一下」，不呼叫 commit，重新討論
+
+其他設定（collect_fields、welcome）：
+- 先呼叫 get_bot_config，在現有基礎上修改，獲確認後才呼叫工具
+
 - 回答問題時：直接給清楚的步驟說明，不要說「超出範圍」或「請問工程師」
 - 修改完後：告知「✅ 已套用」，建議去「測試對話」確認
 - 語氣：專業友善，用繁體中文
@@ -68,17 +77,25 @@ _FUNCTION_DECLARATIONS = [
         )
     ),
     types.FunctionDeclaration(
-        name="update_system_prompt",
-        description="更新 Bot 的角色設定（系統提示詞）。必須先呼叫 get_bot_config 取得現有內容，在原有基礎上只修改用戶指定的部分，保留其他所有結構和邏輯，不可從頭重寫整段。用戶確認後才呼叫。",
+        name="stage_system_prompt",
+        description="暫存提案的角色設定（不會真正儲存）。必須先呼叫 get_bot_config，在原有文字基礎上只改指定部分，其餘一字不動。呼叫後在回覆裡用 code block 顯示完整新 prompt，請用戶確認，等確認後才呼叫 commit_system_prompt。",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
                 "system_prompt": types.Schema(
                     type=types.Type.STRING,
-                    description="修改後的完整系統提示詞，必須包含原有的所有非指定修改部分"
+                    description="提案的完整系統提示詞，非指定修改部分必須與原文一字不差"
                 )
             },
             required=["system_prompt"]
+        )
+    ),
+    types.FunctionDeclaration(
+        name="commit_system_prompt",
+        description="用戶確認後，正式將 stage_system_prompt 暫存的提案儲存到 Bot 設定。只有在用戶明確說「確認」「可以」「套用」等字樣後才呼叫此工具。",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={}
         )
     ),
     types.FunctionDeclaration(
@@ -147,7 +164,7 @@ def _save_snapshot(bot_id: str, source: str = "assistant") -> None:
         logging.warning(f"[Assistant] snapshot failed: {e}")
 
 
-def _execute_tool(tool_name: str, tool_args: dict, bot_id: str) -> str:
+def _execute_tool(tool_name: str, tool_args: dict, bot_id: str, session: dict) -> str:
     """執行工具，直接操作 Supabase"""
     try:
         if tool_name == "get_bot_config":
@@ -158,11 +175,19 @@ def _execute_tool(tool_name: str, tool_args: dict, bot_id: str) -> str:
                 return json.dumps(r.data[0], ensure_ascii=False)
             return json.dumps({"error": "Bot 不存在"})
 
-        elif tool_name == "update_system_prompt":
+        elif tool_name == "stage_system_prompt":
+            # 只暫存，不寫 DB
+            session["staged_prompt"] = tool_args.get("system_prompt", "")
+            return "已暫存提案。請在回覆裡用 code block 顯示完整的新 prompt 讓用戶確認，等用戶說確認後再呼叫 commit_system_prompt。"
+
+        elif tool_name == "commit_system_prompt":
+            staged = session.get("staged_prompt")
+            if not staged:
+                return "找不到暫存提案，請重新 stage_system_prompt。"
             _save_snapshot(bot_id)
-            prompt = tool_args.get("system_prompt", "")
-            _sb.table("bots").update({"system_prompt": prompt}).eq("id", bot_id).execute()
-            return "角色設定已成功更新"
+            _sb.table("bots").update({"system_prompt": staged}).eq("id", bot_id).execute()
+            session.pop("staged_prompt", None)
+            return "✅ 角色設定已正式儲存"
 
         elif tool_name == "update_collect_fields":
             _save_snapshot(bot_id)
@@ -241,7 +266,7 @@ def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_ke
             for p in fc_parts:
                 fc = p.function_call
                 args = dict(fc.args) if fc.args else {}
-                result = _execute_tool(fc.name, args, bot_id)
+                result = _execute_tool(fc.name, args, bot_id, session)
                 logging.info(f"[Assistant] Tool call: {fc.name}({list(args.keys())}) → {result[:80]}")
                 tool_response_parts.append(
                     types.Part(
