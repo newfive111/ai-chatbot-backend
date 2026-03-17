@@ -214,6 +214,17 @@ def _execute_tool(tool_name: str, tool_args: dict, bot_id: str, session: dict) -
         return f"執行失敗：{str(e)}"
 
 
+def _load_system_prompt() -> str:
+    """從 Supabase assistant_config 讀取 system prompt，失敗時 fallback 到程式碼內建版本"""
+    try:
+        r = _sb.table("assistant_config").select("value").eq("key", "system_prompt").execute()
+        if r.data and r.data[0].get("value"):
+            return r.data[0]["value"]
+    except Exception as e:
+        logging.warning(f"[Assistant] Failed to load system prompt from DB: {e}")
+    return ASSISTANT_SYSTEM_PROMPT
+
+
 def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_key: str) -> str:
     """
     執行 AI 助手對話（含 Function Calling 迴圈）
@@ -224,6 +235,7 @@ def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_ke
 
     client = genai.Client(api_key=gemini_api_key)
     tools = types.Tool(function_declarations=_FUNCTION_DECLARATIONS)
+    system_prompt = _load_system_prompt()
 
     # 讀取對話歷史
     from app.chat import session_store
@@ -273,7 +285,7 @@ def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_ke
                 model=ASSISTANT_MODEL,
                 contents=contents,
                 config=types.GenerateContentConfig(
-                    system_instruction=ASSISTANT_SYSTEM_PROMPT,
+                    system_instruction=system_prompt,
                     tools=[tools],
                     max_output_tokens=2048,
                     temperature=0.7
