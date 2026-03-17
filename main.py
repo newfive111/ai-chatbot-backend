@@ -124,8 +124,6 @@ def is_bot_paid(bot_id: str) -> bool:
     return idx < slots
 
 
-FREE_MSG_LIMIT = 300
-
 def check_message_allowed(bot_id: str) -> tuple[bool, str]:
     """
     檢查此 bot 是否允許再收一則訊息。
@@ -147,18 +145,8 @@ def check_message_allowed(bot_id: str) -> tuple[bool, str]:
     if is_paid:
         return True, ""
 
-    # 免費 bot：計算本月訊息數
-    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-    count = supabase.table("conversations") \
-        .select("id", count="exact") \
-        .eq("bot_id", bot_id) \
-        .gte("created_at", month_start) \
-        .execute()
-
-    used = count.count or 0
-    if used >= FREE_MSG_LIMIT:
-        return False, f"免費方案已達每月 {FREE_MSG_LIMIT} 則訊息上限，請升級方案繼續使用。"
-    return True, ""
+    # 未付費 → 鎖定，不允許任何訊息
+    return False, "此服務目前已暫停，如需繼續使用請聯絡我們。"
 
 
 @app.post("/bots")
