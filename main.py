@@ -437,7 +437,7 @@ async def chat(bot_id: str, body: ChatRequest):
 def _get_bot_config(bot_id: str) -> dict:
     """從 Supabase 取得完整 bot 設定"""
     result = supabase.table("bots").select(
-        "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, "
+        "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, quick_replies, "
         "line_channel_secret, line_channel_access_token, "
         "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds, "
         "instagram_page_token"
@@ -475,6 +475,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
         collect_fields = bot.get("collect_fields") or []
         system_prompt  = bot.get("system_prompt") or None
         line_token     = bot.get("line_channel_access_token")
+        quick_replies  = bot.get("quick_replies") or None
         calendar_id    = bot.get("calendar_id") or None
         slot_duration  = bot.get("slot_duration_minutes") or 60
         business_hours = bot.get("business_hours") or None
@@ -504,13 +505,15 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
         if get_session_status(session_id) == "handed_off":
             _muted_line_users.add(f"{bot_id}:{user_id}")
             logging.info(f"[LINE] Auto-muted {user_id} (handed_off)")
+            # 資料收集完成後不再顯示快速選項
+            quick_replies = None
 
         # 優先用 push（不依賴 replyToken 過期），失敗才 fallback
-        push_ok = await push_line_message(user_id, answer, access_token=line_token)
+        push_ok = await push_line_message(user_id, answer, access_token=line_token, quick_replies=quick_replies)
         if push_ok != 200:
             reply_token = buf.get("reply_token", "")
             if reply_token:
-                await reply_line_message(reply_token, answer, access_token=line_token)
+                await reply_line_message(reply_token, answer, access_token=line_token, quick_replies=quick_replies)
                 logging.info(f"[LINE] Fallback to replyToken for {user_id}")
 
     except Exception as e:
@@ -545,7 +548,7 @@ async def line_webhook(bot_id: str, request: Request):
                 session_id = f"line_{bot_id}_{user_id}"
                 from app.chat.session_store import get_or_create
                 get_or_create(session_id)
-                await reply_line_message(reply_token, welcome, access_token=line_token)
+                await reply_line_message(reply_token, welcome, access_token=line_token, quick_replies=bot.get("quick_replies") or None)
             continue
 
         # ── 只處理文字訊息 ──
@@ -561,7 +564,7 @@ async def line_webhook(bot_id: str, request: Request):
             reset_session(session_id)
             _muted_line_users.discard(buf_key)
             welcome = bot.get("welcome_message") or f"（記憶已重置）你好！我是{bot.get('name', 'AI 助理')}，有什麼可以幫您的嗎？😊"
-            await reply_line_message(reply_token, welcome, access_token=line_token)
+            await reply_line_message(reply_token, welcome, access_token=line_token, quick_replies=bot.get("quick_replies") or None)
             continue
 
         # ── 靜音檢查（已交接，不再 AI 回應）──
