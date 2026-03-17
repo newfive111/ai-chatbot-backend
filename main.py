@@ -629,6 +629,60 @@ async def assistant_chat(
 
 
 # ──────────────────────────────────────
+# 設定歷史紀錄
+# ──────────────────────────────────────
+
+@app.get("/bots/{bot_id}/settings-history")
+async def get_settings_history(
+    bot_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    """取得 Bot 設定歷史快照（最近 30 筆）"""
+    user_id = get_user_id(authorization)
+    bot = supabase.table("bots").select("id").eq("id", bot_id).eq("user_id", user_id).execute()
+    if not bot.data:
+        raise HTTPException(404, "Bot 不存在")
+    rows = supabase.table("bot_settings_history") \
+        .select("id, source, system_prompt, collect_fields, welcome_message, quick_replies, created_at") \
+        .eq("bot_id", bot_id) \
+        .order("created_at", desc=True) \
+        .limit(30) \
+        .execute()
+    return rows.data or []
+
+
+@app.post("/bots/{bot_id}/settings-history/{snapshot_id}/restore")
+async def restore_settings_snapshot(
+    bot_id: str,
+    snapshot_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    """還原 Bot 設定到指定快照"""
+    user_id = get_user_id(authorization)
+    bot = supabase.table("bots").select("id").eq("id", bot_id).eq("user_id", user_id).execute()
+    if not bot.data:
+        raise HTTPException(404, "Bot 不存在")
+
+    snap = supabase.table("bot_settings_history") \
+        .select("*").eq("id", snapshot_id).eq("bot_id", bot_id).execute()
+    if not snap.data:
+        raise HTTPException(404, "快照不存在")
+
+    # 還原前先存一份當前狀態
+    from app.assistant.engine import _save_snapshot
+    _save_snapshot(bot_id, source="restore")
+
+    s = snap.data[0]
+    supabase.table("bots").update({
+        "system_prompt":   s.get("system_prompt") or "",
+        "collect_fields":  s.get("collect_fields") or [],
+        "welcome_message": s.get("welcome_message") or "",
+        "quick_replies":   s.get("quick_replies") or [],
+    }).eq("id", bot_id).execute()
+    return {"ok": True, "restored_at": s["created_at"]}
+
+
+# ──────────────────────────────────────
 # 對話記錄查詢
 # ──────────────────────────────────────
 

@@ -127,6 +127,26 @@ _FUNCTION_DECLARATIONS = [
 ]
 
 
+def _save_snapshot(bot_id: str, source: str = "assistant") -> None:
+    """更新前把目前設定存一份快照到 bot_settings_history"""
+    try:
+        r = _sb.table("bots").select(
+            "system_prompt, collect_fields, welcome_message, quick_replies"
+        ).eq("id", bot_id).execute()
+        if r.data:
+            row = r.data[0]
+            _sb.table("bot_settings_history").insert({
+                "bot_id":          bot_id,
+                "source":          source,
+                "system_prompt":   row.get("system_prompt") or "",
+                "collect_fields":  row.get("collect_fields") or [],
+                "welcome_message": row.get("welcome_message") or "",
+                "quick_replies":   row.get("quick_replies") or [],
+            }).execute()
+    except Exception as e:
+        logging.warning(f"[Assistant] snapshot failed: {e}")
+
+
 def _execute_tool(tool_name: str, tool_args: dict, bot_id: str) -> str:
     """執行工具，直接操作 Supabase"""
     try:
@@ -139,11 +159,13 @@ def _execute_tool(tool_name: str, tool_args: dict, bot_id: str) -> str:
             return json.dumps({"error": "Bot 不存在"})
 
         elif tool_name == "update_system_prompt":
+            _save_snapshot(bot_id)
             prompt = tool_args.get("system_prompt", "")
             _sb.table("bots").update({"system_prompt": prompt}).eq("id", bot_id).execute()
             return "角色設定已成功更新"
 
         elif tool_name == "update_collect_fields":
+            _save_snapshot(bot_id)
             fields = tool_args.get("fields", [])
             upd: dict = {"collect_fields": fields}
             if tool_args.get("sheet_id"):
@@ -152,6 +174,7 @@ def _execute_tool(tool_name: str, tool_args: dict, bot_id: str) -> str:
             return f"收集欄位已成功更新：{fields}"
 
         elif tool_name == "update_welcome":
+            _save_snapshot(bot_id)
             _sb.table("bots").update({
                 "welcome_message": tool_args.get("welcome_message", ""),
                 "quick_replies": tool_args.get("quick_replies", [])
