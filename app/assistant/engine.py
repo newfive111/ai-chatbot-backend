@@ -238,14 +238,19 @@ def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_ke
 
     if staged:
         if any(kw in user_message for kw in _CONFIRM_KW):
-            _save_snapshot(bot_id)
-            _sb.table("bots").update({"system_prompt": staged}).eq("id", bot_id).execute()
-            session.pop("staged_prompt", None)
-            history.append({"role": "user",      "content": user_message})
-            history.append({"role": "assistant",  "content": "✅ 角色設定已套用！建議到「測試對話」確認效果。"})
-            session["history"] = history
-            session_store.save(session_id, session)
-            return "✅ 角色設定已套用！建議到「測試對話」確認效果。"
+            try:
+                _save_snapshot(bot_id)
+                _sb.table("bots").update({"system_prompt": staged}).eq("id", bot_id).execute()
+                session.pop("staged_prompt", None)
+                history.append({"role": "user",      "content": user_message})
+                history.append({"role": "assistant",  "content": "✅ 角色設定已套用！建議到「測試對話」確認效果。"})
+                session["history"] = history
+                session_store.save(session_id, session)
+                logging.info(f"[Assistant] Auto-committed staged_prompt for bot {bot_id[:8]}")
+                return "✅ 角色設定已套用！建議到「測試對話」確認效果。"
+            except Exception as e:
+                logging.error(f"[Assistant] Auto-commit failed for bot {bot_id[:8]}: {e}")
+                return f"⚠️ 儲存失敗：{str(e)[:100]}，請稍後再試或手動點「儲存角色設定」按鈕。"
         elif any(kw in user_message for kw in _CANCEL_KW):
             session.pop("staged_prompt", None)
             history.append({"role": "user",      "content": user_message})
