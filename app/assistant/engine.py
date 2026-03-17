@@ -43,7 +43,10 @@ ASSISTANT_SYSTEM_PROMPT = """
   注意：預約功能啟用後，Bot 的角色設定必須存在（在「🤖 角色」tab 設定），否則預約邏輯不會生效
 
 【操作原則】
-- 修改設定前：先告知用戶打算做什麼，獲確認後才呼叫工具
+- 修改任何設定前：必須先呼叫 get_bot_config 取得現有設定，在現有內容的基礎上修改，絕對不能從頭重寫
+- 修改角色設定（system_prompt）時：只更動用戶指定的部分（例如「改成健身房」只換行業和專業領域描述），其餘結構、語氣、收集欄位邏輯等都完整保留
+- 若原本沒有 system_prompt（空白），才從頭建立新的
+- 修改前告知用戶打算怎麼改、保留哪些、只改哪些，獲確認後才呼叫工具
 - 回答問題時：直接給清楚的步驟說明，不要說「超出範圍」或「請問工程師」
 - 修改完後：告知「✅ 已套用」，建議去「測試對話」確認
 - 語氣：專業友善，用繁體中文
@@ -58,7 +61,7 @@ system_prompt 包含：角色定位、語氣風格、專業領域、禁忌事項
 _FUNCTION_DECLARATIONS = [
     types.FunctionDeclaration(
         name="get_bot_config",
-        description="取得目前 Bot 的所有設定，包含角色描述、收集欄位、歡迎訊息等。在建議改動前先呼叫這個工具了解現狀。",
+        description="取得目前 Bot 的所有設定，包含角色描述、收集欄位、歡迎訊息等。修改任何設定前必須先呼叫此工具，才能在現有內容基礎上做局部修改，而非從頭覆蓋。",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={}
@@ -66,13 +69,13 @@ _FUNCTION_DECLARATIONS = [
     ),
     types.FunctionDeclaration(
         name="update_system_prompt",
-        description="更新 Bot 的角色設定（系統提示詞）。用戶確認後才呼叫。",
+        description="更新 Bot 的角色設定（系統提示詞）。必須先呼叫 get_bot_config 取得現有內容，在原有基礎上只修改用戶指定的部分，保留其他所有結構和邏輯，不可從頭重寫整段。用戶確認後才呼叫。",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
                 "system_prompt": types.Schema(
                     type=types.Type.STRING,
-                    description="完整的系統提示詞內容"
+                    description="修改後的完整系統提示詞，必須包含原有的所有非指定修改部分"
                 )
             },
             required=["system_prompt"]
