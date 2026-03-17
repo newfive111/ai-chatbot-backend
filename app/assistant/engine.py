@@ -44,17 +44,17 @@ ASSISTANT_SYSTEM_PROMPT = """
 
 【操作原則 — 嚴格遵守】
 
-角色設定（system_prompt）修改流程（必須依序執行）：
-1. 先呼叫 get_bot_config 取得現有內容
-2. 在現有文字基礎上，只修改用戶明確指定的部分，其餘文字一字不動地複製保留
-3. 呼叫 stage_system_prompt 暫存提案（此時不會真正儲存）
-4. 在你的回覆裡用 code block 顯示完整的新 prompt 全文，讓用戶對照檢查
-5. 明確詢問「這樣修改可以嗎？確認後我會套用。」
-6. 等用戶說「確認」「可以」「套用」等字樣後，才呼叫 commit_system_prompt 正式儲存
-7. 若用戶說「不要」「取消」「改一下」，不呼叫 commit，重新討論
+角色設定（system_prompt）修改流程：
+1. 先呼叫 get_bot_config 取得現有 system_prompt 原文
+2. 從原文中找出要修改的「精確舊文字」（逐字複製，不要改動）
+3. 決定「新文字」（只包含要替換的部分，不是整段 prompt）
+4. 呼叫 replace_in_system_prompt(find=精確舊文字, replace=新文字) — 後端會做精準字串替換，其他內容一字不動
+5. 若原本完全沒有 system_prompt（空白），才使用 set_system_prompt 從頭建立
+6. 改完後告知用戶改了什麼，並提醒「如有問題可點 🕐 歷史 還原」
+7. 不需要確認步驟，直接套用，歷史紀錄會自動備份
 
 其他設定（collect_fields、welcome）：
-- 先呼叫 get_bot_config，在現有基礎上修改，獲確認後才呼叫工具
+- 先呼叫 get_bot_config，直接呼叫對應工具修改，不需要確認
 
 - 回答問題時：直接給清楚的步驟說明，不要說「超出範圍」或「請問工程師」
 - 修改完後：告知「✅ 已套用」，建議去「測試對話」確認
@@ -77,25 +77,35 @@ _FUNCTION_DECLARATIONS = [
         )
     ),
     types.FunctionDeclaration(
-        name="stage_system_prompt",
-        description="暫存提案的角色設定（不會真正儲存）。必須先呼叫 get_bot_config，在原有文字基礎上只改指定部分，其餘一字不動。呼叫後在回覆裡用 code block 顯示完整新 prompt，請用戶確認，等確認後才呼叫 commit_system_prompt。",
+        name="replace_in_system_prompt",
+        description="在現有 system_prompt 中做精準字串替換。必須先呼叫 get_bot_config 取得原文，從中逐字複製要替換的舊文字，再提供新文字。後端直接做 string replace，其他內容完全不動。",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "find": types.Schema(
+                    type=types.Type.STRING,
+                    description="要被替換的精確舊文字，必須與 get_bot_config 回傳的原文完全一致（逐字複製）"
+                ),
+                "replace": types.Schema(
+                    type=types.Type.STRING,
+                    description="替換後的新文字"
+                )
+            },
+            required=["find", "replace"]
+        )
+    ),
+    types.FunctionDeclaration(
+        name="set_system_prompt",
+        description="從頭建立全新的 system_prompt。只有在 get_bot_config 確認原本 system_prompt 完全是空白時才使用，其他情況請用 replace_in_system_prompt。",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
                 "system_prompt": types.Schema(
                     type=types.Type.STRING,
-                    description="提案的完整系統提示詞，非指定修改部分必須與原文一字不差"
+                    description="完整的新系統提示詞"
                 )
             },
             required=["system_prompt"]
-        )
-    ),
-    types.FunctionDeclaration(
-        name="commit_system_prompt",
-        description="用戶確認後，正式將 stage_system_prompt 暫存的提案儲存到 Bot 設定。只有在用戶明確說「確認」「可以」「套用」等字樣後才呼叫此工具。",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={}
         )
     ),
     types.FunctionDeclaration(
@@ -175,19 +185,25 @@ def _execute_tool(tool_name: str, tool_args: dict, bot_id: str, session: dict) -
                 return json.dumps(r.data[0], ensure_ascii=False)
             return json.dumps({"error": "Bot 不存在"})
 
-        elif tool_name == "stage_system_prompt":
-            # 只暫存，不寫 DB
-            session["staged_prompt"] = tool_args.get("system_prompt", "")
-            return "已暫存提案。請在回覆裡用 code block 顯示完整的新 prompt 讓用戶確認，等用戶說確認後再呼叫 commit_system_prompt。"
-
-        elif tool_name == "commit_system_prompt":
-            staged = session.get("staged_prompt")
-            if not staged:
-                return "找不到暫存提案，請重新 stage_system_prompt。"
+        elif tool_name == "replace_in_system_prompt":
+            find_str    = tool_args.get("find", "")
+            replace_str = tool_args.get("replace", "")
+            if not find_str:
+                return "❌ find 不能為空"
+            r = _sb.table("bots").select("system_prompt").eq("id", bot_id).execute()
+            current = (r.data[0].get("system_prompt") or "") if r.data else ""
+            if find_str not in current:
+                return f"❌ 找不到指定文字，請重新呼叫 get_bot_config 確認原文後再試。找尋內容：「{find_str[:40]}」"
+            new_prompt = current.replace(find_str, replace_str, 1)
             _save_snapshot(bot_id)
-            _sb.table("bots").update({"system_prompt": staged}).eq("id", bot_id).execute()
-            session.pop("staged_prompt", None)
-            return "✅ 角色設定已正式儲存"
+            _sb.table("bots").update({"system_prompt": new_prompt}).eq("id", bot_id).execute()
+            return "✅ 已精準替換指定段落，其他內容完全保留"
+
+        elif tool_name == "set_system_prompt":
+            prompt = tool_args.get("system_prompt", "")
+            _save_snapshot(bot_id)
+            _sb.table("bots").update({"system_prompt": prompt}).eq("id", bot_id).execute()
+            return "✅ 角色設定已建立"
 
         elif tool_name == "update_collect_fields":
             _save_snapshot(bot_id)
@@ -241,35 +257,6 @@ def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_ke
     from app.chat import session_store
     session = session_store.get_or_create(session_id)
     history: list = session.get("history", [])
-
-    # ── 自動確認：若有暫存 prompt 且用戶說確認，直接套用不靠 Gemini ──
-    _CONFIRM_KW = {"確認", "可以", "套用", "好的", "沒問題", "ok", "yes", "行", "好"}
-    _CANCEL_KW  = {"取消", "不要", "不用", "算了", "cancel", "no"}
-    staged = session.get("staged_prompt")
-    msg_stripped = user_message.strip().lower()
-
-    if staged:
-        if any(kw in user_message for kw in _CONFIRM_KW):
-            try:
-                _save_snapshot(bot_id)
-                _sb.table("bots").update({"system_prompt": staged}).eq("id", bot_id).execute()
-                session.pop("staged_prompt", None)
-                history.append({"role": "user",      "content": user_message})
-                history.append({"role": "assistant",  "content": "✅ 角色設定已套用！建議到「測試對話」確認效果。"})
-                session["history"] = history
-                session_store.save(session_id, session)
-                logging.info(f"[Assistant] Auto-committed staged_prompt for bot {bot_id[:8]}")
-                return "✅ 角色設定已套用！建議到「測試對話」確認效果。"
-            except Exception as e:
-                logging.error(f"[Assistant] Auto-commit failed for bot {bot_id[:8]}: {e}")
-                return f"⚠️ 儲存失敗：{str(e)[:100]}，請稍後再試或手動點「儲存角色設定」按鈕。"
-        elif any(kw in user_message for kw in _CANCEL_KW):
-            session.pop("staged_prompt", None)
-            history.append({"role": "user",      "content": user_message})
-            history.append({"role": "assistant",  "content": "已取消，設定不變。有需要可以隨時重新告訴我要怎麼改。"})
-            session["history"] = history
-            session_store.save(session_id, session)
-            return "已取消，設定不變。有需要可以隨時重新告訴我要怎麼改。"
 
     # 組 contents（多輪對話）
     contents: list[types.Content] = []
