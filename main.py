@@ -463,7 +463,7 @@ def _get_bot_config(bot_id: str) -> dict:
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, quick_replies, "
         "line_channel_secret, line_channel_access_token, "
         "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds, "
-        "instagram_page_token"
+        "instagram_page_token, instagram_account_id"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
@@ -953,8 +953,14 @@ async def instagram_webhook(bot_id: str, request: Request):
 async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
     """非同步處理 Instagram 訊息"""
     try:
+        # 訂閱檢查
+        allowed, _ = check_message_allowed(bot_id)
+        if not allowed:
+            return
+
         bot = _get_bot_config(bot_id)
-        page_token = bot.get("instagram_page_token")
+        page_token  = bot.get("instagram_page_token")
+        ig_acct_id  = bot.get("instagram_account_id") or None
         if not page_token:
             logging.warning(f"[Instagram] bot {bot_id[:8]} has no page_token, skipping")
             return
@@ -990,7 +996,7 @@ async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
                 raise
 
         from app.instagram.webhook import send_instagram_message
-        status = await send_instagram_message(sender_id, answer, page_token)
+        status = await send_instagram_message(sender_id, answer, page_token, ig_account_id=ig_acct_id)
         logging.info(f"[Instagram] Sent reply to {sender_id}, status={status}")
 
         supabase.table("conversations").insert({
