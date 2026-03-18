@@ -276,11 +276,14 @@ async def update_bot(
                         if _r2.status_code == 200:
                             ig_account_id = _r2.json().get("instagram_business_account", {}).get("id", "")
 
-                    # Fallback: 若取不到 IG account ID，用 Page ID（適用 Page object webhook）
+                    # 儲存 IG Business Account ID 用於發送訊息
+                    # 同時儲存 Page ID 用於 webhook 路由（page 物件情況）
                     final_id = ig_account_id or page_id
                     if final_id:
                         update_data["instagram_account_id"] = final_id
-                        logging.info(f"[Instagram] account_id={final_id} (ig={ig_account_id}, page={page_id}) for bot {bot_id[:8]}")
+                    if page_id:
+                        update_data["facebook_page_id"] = page_id
+                    logging.info(f"[Instagram] ig_account_id={ig_account_id}, page_id={page_id}, stored={final_id} for bot {bot_id[:8]}")
         except Exception as e:
             logging.warning(f"[Instagram] Failed to fetch account ID: {e}")
 
@@ -463,7 +466,7 @@ def _get_bot_config(bot_id: str) -> dict:
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, quick_replies, "
         "line_channel_secret, line_channel_access_token, "
         "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds, "
-        "instagram_page_token, instagram_account_id"
+        "instagram_page_token, instagram_account_id, facebook_page_id"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
@@ -850,16 +853,25 @@ async def instagram_webhook_global(request: Request):
     """接收 Meta App 層級 Instagram Webhook，依 instagram_account_id 路由到對應 bot"""
     data = await request.json()
 
+    # ── DEBUG：完整記錄收到的 payload ──
+    import json as _json
+    logging.info(f"[Instagram] Webhook received: object={data.get('object')}, raw={_json.dumps(data)[:500]}")
+
     if data.get("object") not in ("instagram", "page"):
+        logging.warning(f"[Instagram] Unknown object type: {data.get('object')}")
         return {"status": "ignored"}
 
     for entry in data.get("entry", []):
         account_id = str(entry.get("id", ""))
+        logging.info(f"[Instagram] Entry id={account_id}, keys={list(entry.keys())}")
         if not account_id:
             continue
 
         # 依 instagram_account_id 找 bot（精確匹配）
         rows = supabase.table("bots").select("id").eq("instagram_account_id", account_id).execute()
+        if not rows.data:
+            # Fallback: 嘗試用 facebook_page_id 欄位比對（page 物件情況）
+            rows = supabase.table("bots").select("id").eq("facebook_page_id", account_id).execute()
         if not rows.data:
             logging.warning(f"[Instagram] No bot found for account_id={account_id}, payload_object={data.get('object')}")
             continue
