@@ -250,6 +250,24 @@ async def update_bot(
         elif k in ("system_prompt", "welcome_message"):
             # 明確傳入空字串 → 允許清空
             update_data[k] = ""
+
+    # 儲存 Instagram token 時，自動抓 IG 帳號 ID 存入 DB（用於 webhook 路由）
+    if "instagram_page_token" in update_data and update_data["instagram_page_token"]:
+        try:
+            async with httpx.AsyncClient() as _hc:
+                _r = await _hc.get(
+                    "https://graph.facebook.com/me",
+                    params={"access_token": update_data["instagram_page_token"], "fields": "id,name"},
+                    timeout=5,
+                )
+                if _r.status_code == 200:
+                    ig_id = _r.json().get("id", "")
+                    if ig_id:
+                        update_data["instagram_account_id"] = ig_id
+                        logging.info(f"[Instagram] Auto-fetched account_id={ig_id} for bot {bot_id[:8]}")
+        except Exception as e:
+            logging.warning(f"[Instagram] Failed to fetch account ID: {e}")
+
     if update_data:
         supabase.table("bots").update(update_data).eq("id", bot_id).execute()
     return {"message": "更新成功"}
@@ -794,6 +812,70 @@ async def get_conversations(
 # ──────────────────────────────────────
 # Instagram Webhook
 # ──────────────────────────────────────
+
+# ── 通用 Instagram Webhook（Meta App 層級，不帶 bot_id）──
+IG_VERIFY_TOKEN = "ldh_verify_token"
+
+@app.get("/instagram/webhook")
+async def instagram_webhook_verify_global(
+    hub_mode: Optional[str]         = Query(None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
+    hub_challenge: Optional[str]    = Query(None, alias="hub.challenge"),
+):
+    """Meta App 層級 Webhook 驗證"""
+    if hub_mode == "subscribe" and hub_verify_token == IG_VERIFY_TOKEN:
+        logging.info("[Instagram] Global webhook verified")
+        return PlainTextResponse(hub_challenge)
+    raise HTTPException(403, "驗證失敗：Verify Token 不符")
+
+
+@app.post("/instagram/webhook")
+async def instagram_webhook_global(request: Request):
+    """接收 Meta App 層級 Instagram Webhook，依 instagram_account_id 路由到對應 bot"""
+    data = await request.json()
+
+    if data.get("object") not in ("instagram", "page"):
+        return {"status": "ignored"}
+
+    for entry in data.get("entry", []):
+        account_id = str(entry.get("id", ""))
+        if not account_id:
+            continue
+
+        # 依 instagram_account_id 找 bot
+        rows = supabase.table("bots").select("id").eq("instagram_account_id", account_id).execute()
+        if not rows.data:
+            logging.warning(f"[Instagram] No bot found for account_id={account_id}")
+            continue
+        bot_id = rows.data[0]["id"]
+
+        # ── DM 事件 ──
+        for event in entry.get("messaging", []):
+            sender_id = event.get("sender", {}).get("id")
+            msg       = event.get("message", {})
+            text      = msg.get("text", "").strip()
+            if not text or msg.get("is_echo"):
+                continue
+            logging.info(f"[Instagram] DM bot={bot_id[:8]} sender={sender_id}")
+            asyncio.create_task(_process_instagram_message(bot_id, sender_id, text))
+
+        # ── 留言事件 ──
+        for change in entry.get("changes", []):
+            if change.get("field") != "feed":
+                continue
+            value = change.get("value", {})
+            if value.get("item") != "comment" or value.get("verb") not in ("add",):
+                continue
+            comment_id   = value.get("comment_id") or value.get("id")
+            text         = value.get("message", "").strip()
+            commenter_id = value.get("from", {}).get("id", "")
+            if not comment_id or not text:
+                continue
+            logging.info(f"[Instagram] Comment bot={bot_id[:8]} comment={comment_id}")
+            asyncio.create_task(_process_instagram_comment(bot_id, comment_id, commenter_id, text))
+
+    return {"status": "ok"}
+
 
 @app.get("/instagram/webhook/{bot_id}")
 async def instagram_webhook_verify(
