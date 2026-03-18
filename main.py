@@ -251,20 +251,36 @@ async def update_bot(
             # 明確傳入空字串 → 允許清空
             update_data[k] = ""
 
-    # 儲存 Instagram token 時，自動抓 IG 帳號 ID 存入 DB（用於 webhook 路由）
+    # 儲存 Instagram token 時，自動抓 IG Business Account ID 存入 DB（用於 webhook 路由）
     if "instagram_page_token" in update_data and update_data["instagram_page_token"]:
         try:
+            token_val = update_data["instagram_page_token"]
             async with httpx.AsyncClient() as _hc:
+                # Step 1: 取得 Facebook Page ID
                 _r = await _hc.get(
                     "https://graph.facebook.com/me",
-                    params={"access_token": update_data["instagram_page_token"], "fields": "id,name"},
+                    params={"access_token": token_val, "fields": "id,name"},
                     timeout=5,
                 )
                 if _r.status_code == 200:
-                    ig_id = _r.json().get("id", "")
-                    if ig_id:
-                        update_data["instagram_account_id"] = ig_id
-                        logging.info(f"[Instagram] Auto-fetched account_id={ig_id} for bot {bot_id[:8]}")
+                    page_id = _r.json().get("id", "")
+                    ig_account_id = ""
+
+                    # Step 2: 從 Page 取得 Instagram Business Account ID
+                    if page_id:
+                        _r2 = await _hc.get(
+                            f"https://graph.facebook.com/{page_id}",
+                            params={"access_token": token_val, "fields": "instagram_business_account"},
+                            timeout=5,
+                        )
+                        if _r2.status_code == 200:
+                            ig_account_id = _r2.json().get("instagram_business_account", {}).get("id", "")
+
+                    # Fallback: 若取不到 IG account ID，用 Page ID（適用 Page object webhook）
+                    final_id = ig_account_id or page_id
+                    if final_id:
+                        update_data["instagram_account_id"] = final_id
+                        logging.info(f"[Instagram] account_id={final_id} (ig={ig_account_id}, page={page_id}) for bot {bot_id[:8]}")
         except Exception as e:
             logging.warning(f"[Instagram] Failed to fetch account ID: {e}")
 
@@ -842,12 +858,13 @@ async def instagram_webhook_global(request: Request):
         if not account_id:
             continue
 
-        # 依 instagram_account_id 找 bot
+        # 依 instagram_account_id 找 bot（精確匹配）
         rows = supabase.table("bots").select("id").eq("instagram_account_id", account_id).execute()
         if not rows.data:
-            logging.warning(f"[Instagram] No bot found for account_id={account_id}")
+            logging.warning(f"[Instagram] No bot found for account_id={account_id}, payload_object={data.get('object')}")
             continue
         bot_id = rows.data[0]["id"]
+        logging.info(f"[Instagram] Routed to bot={bot_id[:8]} for account_id={account_id}")
 
         # ── DM 事件 ──
         for event in entry.get("messaging", []):
