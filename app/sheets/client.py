@@ -5,7 +5,9 @@ import os
 import json
 import base64
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+TZ_TAIPEI = timezone(timedelta(hours=8))
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -76,7 +78,7 @@ def upsert_row(
     extra_keys = list((extra_fields or {}).keys())
     headers = ensure_headers(sheet, fields, extra_fields=extra_keys)
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
     display_key = display_name if display_name else session_id
 
     # 依照實際 headers 順序組 row
@@ -113,5 +115,5 @@ def append_row(sheet_id: str, fields: List[str], data: Dict[str, str]):
     """舊版相容：直接新增一行（不含 session_id）"""
     sheet = get_sheet(sheet_id)
     ensure_headers(sheet, fields)
-    row = [data.get(f, "") for f in fields] + [datetime.now().strftime("%Y-%m-%d %H:%M")]
+    row = [data.get(f, "") for f in fields] + [datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")]
     sheet.append_row(row)
