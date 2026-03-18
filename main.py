@@ -9,6 +9,7 @@ import time
 import uuid
 import asyncio
 import logging
+import httpx
 
 from app.rag.processor import extract_text_from_pdf, chunk_text
 from app.rag.embeddings import store_chunks, search_similar_chunks
@@ -465,6 +466,22 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
         business_hours = bot.get("business_hours") or None
         keyword_triggers = bot.get("keyword_triggers") or None
 
+        # 抓 LINE 暱稱，存入試算表方便對應聊天室
+        line_display_name = ""
+        if sheet_id and line_token:
+            try:
+                async with httpx.AsyncClient() as _hc:
+                    _r = await _hc.get(
+                        f"https://api.line.me/v2/bot/profile/{user_id}",
+                        headers={"Authorization": f"Bearer {line_token}"},
+                        timeout=5,
+                    )
+                    if _r.status_code == 200:
+                        line_display_name = _r.json().get("displayName", "")
+            except Exception:
+                pass
+        extra_sheet = {"LINE暱稱": line_display_name} if line_display_name else None
+
         try:
             answer = generate_answer(
                 bot_id, combined_msg, bot_name,
@@ -477,6 +494,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
                 slot_duration_minutes=slot_duration,
                 business_hours=business_hours,
                 keyword_triggers=keyword_triggers,
+                extra_sheet_fields=extra_sheet,
             )
         except Exception as e:
             if "NO_API_KEY" in str(e):

@@ -36,39 +36,68 @@ def get_sheet(sheet_id: str):
     return client.open_by_key(sheet_id).sheet1
 
 
-def ensure_headers(sheet, fields: List[str], with_session_id: bool = False):
-    """確保第一行有欄位標題"""
-    existing = sheet.row_values(1)
-    if with_session_id:
-        all_fields = ["session_id"] + fields + ["更新時間"]
-    else:
-        all_fields = fields + ["時間"]
-    if existing != all_fields:
-        sheet.update("A1", [all_fields])
+def ensure_headers(sheet, fields: List[str], extra_fields: List[str] = None) -> List[str]:
+    """
+    確保第一行有欄位標題。
+    - 固定格式：session_id | fields... | extra_fields... | 更新時間
+    - 若標題列缺少欄位則補上（不刪除已有欄位）
+    """
+    existing = [h for h in sheet.row_values(1) if h]  # 去掉空格
+    base = ["session_id"] + fields
+    extras = extra_fields or []
+
+    # 保留既有非標準欄位（不強制覆蓋），只補上缺少的
+    without_time = [h for h in existing if h != "更新時間"]
+    new_extras = [e for e in extras if e not in without_time]
+    final = without_time + new_extras + ["更新時間"]
+
+    if existing + ["更新時間"] != final:
+        sheet.update("A1", [final])
+
+    return final
 
 
-def upsert_row(sheet_id: str, session_id: str, fields: List[str], data: Dict[str, str], display_name: str = None):
+def upsert_row(
+    sheet_id: str,
+    session_id: str,
+    fields: List[str],
+    data: Dict[str, str],
+    display_name: str = None,
+    extra_fields: Dict[str, str] = None,
+):
     """
     Incremental save：每收到一個欄位就即時更新。
     - display_name: 有姓名欄位時顯示名稱（如「陳大明」），否則顯示 session_id
+    - extra_fields: 額外欄位 dict，如 {"LINE暱稱": "王小明"}
     - 用 session_id 或 display_name 找到已有的行 → 更新它
     - 找不到 → 新增一行
     """
     sheet = get_sheet(sheet_id)
-    ensure_headers(sheet, fields, with_session_id=True)
+    extra_keys = list((extra_fields or {}).keys())
+    headers = ensure_headers(sheet, fields, extra_fields=extra_keys)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     display_key = display_name if display_name else session_id
-    row_data = [display_key] + [data.get(f, "") for f in fields] + [now]
 
-    # 搜尋第一欄找已有的行（先找 display_name，再找 session_id）
-    col_a = sheet.col_values(1)  # [header, name1, name2, ...]
+    # 依照實際 headers 順序組 row
+    row_data = []
+    for h in headers:
+        if h == "session_id":
+            row_data.append(display_key)
+        elif h == "更新時間":
+            row_data.append(now)
+        elif h in data:
+            row_data.append(data[h])
+        elif extra_fields and h in extra_fields:
+            row_data.append(extra_fields[h])
+        else:
+            row_data.append("")
+
+    # 搜尋第一欄找已有的行
+    col_a = sheet.col_values(1)
     row_index = None
-
-    # 先找 display_key（名字或 session_id）
     if display_key in col_a:
         row_index = col_a.index(display_key) + 1
-    # 若 display_name 存在但 col_a 還存著舊的 session_id → 找並更新
     elif display_name and session_id in col_a:
         row_index = col_a.index(session_id) + 1
 

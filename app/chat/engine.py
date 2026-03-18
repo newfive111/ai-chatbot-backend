@@ -280,7 +280,12 @@ def _get_display_name(data: dict) -> str:
     return None
 
 
-def _extract_and_save_data(raw_reply: str, sheet_id: str, session_id: str) -> Tuple[str, bool]:
+def _extract_and_save_data(
+    raw_reply: str,
+    sheet_id: str,
+    session_id: str,
+    extra_sheet_fields: Optional[dict] = None,
+) -> Tuple[str, bool]:
     """
     偵測 Claude 回覆中的 DATA_SAVE: {...}，寫入 Google Sheet。
     回傳 (清理後文字, 是否找到DATA_SAVE)
@@ -297,7 +302,7 @@ def _extract_and_save_data(raw_reply: str, sheet_id: str, session_id: str) -> Tu
         try:
             from app.sheets.client import upsert_row
             display_name = _get_display_name(data)
-            upsert_row(sheet_id, session_id, fields, data, display_name=display_name)
+            upsert_row(sheet_id, session_id, fields, data, display_name=display_name, extra_fields=extra_sheet_fields)
             logging.info(f"[Sheet] DATA_SAVE written session={session_id[:8]} fields={fields}")
         except Exception as e:
             logging.warning(f"[Sheet] DATA_SAVE write failed: {e}")
@@ -328,6 +333,8 @@ def generate_answer(
     business_hours: Optional[dict] = None,
     # 關鍵字觸發
     keyword_triggers: Optional[list] = None,
+    # 額外寫入試算表的欄位（如 LINE暱稱）
+    extra_sheet_fields: Optional[dict] = None,
 ) -> str:
     if not api_key:
         raise Exception("NO_API_KEY")
@@ -373,7 +380,7 @@ def generate_answer(
             raw_reply = _call_ai(api_key, system_prompt, history, question)
 
         if sheet_id and session_id:
-            clean_reply, data_saved = _extract_and_save_data(raw_reply, sheet_id, session_id)
+            clean_reply, data_saved = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
             if data_saved:
                 session["status"] = "handed_off"
                 logging.info(f"[Engine] {session_id[:8]} → handed_off (DATA_SAVE)")
