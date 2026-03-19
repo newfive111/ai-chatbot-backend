@@ -547,6 +547,11 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
             # 資料收集完成後不再顯示快速選項
             quick_replies = None
 
+        # 任務完成後靜默（handed_off → engine 回空字串）
+        if not answer:
+            logging.info(f"[LINE] Silent (handed_off) for {user_id}")
+            return
+
         # 優先用 push（不依賴 replyToken 過期），失敗才 fallback
         push_ok = await push_line_message(user_id, answer, access_token=line_token, quick_replies=quick_replies)
         if push_ok != 200:

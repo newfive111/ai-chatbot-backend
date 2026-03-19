@@ -398,8 +398,8 @@ def generate_answer(
         if session_id:
             session = session_store.get_or_create(session_id)
             if session.get("status") == "handed_off":
-                logging.info(f"[Engine] {session_id[:8]} handed_off → holding reply")
-                return handoff_reply or HANDOFF_REPLY
+                logging.info(f"[Engine] {session_id[:8]} handed_off → silent")
+                return ""
             history = session.get("history", [])
         else:
             session = None
