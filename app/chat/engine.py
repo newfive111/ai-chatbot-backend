@@ -280,6 +280,40 @@ def _get_display_name(data: dict) -> str:
     return None
 
 
+def _extract_json_object(text: str) -> Optional[str]:
+    """
+    從 DATA_SAVE: 或 DATA_SAVE： 之後提取完整 JSON 物件。
+    使用括號平衡法，正確處理巢狀結構與字串內的括號。
+    支援英文冒號 ':' 和中文全形冒號 '：'。
+    """
+    m = re.search(r'DATA_SAVE\s*[:\uff1a]\s*(\{)', text, re.IGNORECASE)
+    if not m:
+        return None
+    start = m.start(1)
+    depth = 0
+    in_str = False
+    escape = False
+    for i, c in enumerate(text[start:]):
+        if escape:
+            escape = False
+            continue
+        if c == '\\' and in_str:
+            escape = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start: start + i + 1]
+    return None
+
+
 def _extract_and_save_data(
     raw_reply: str,
     sheet_id: str,
@@ -287,15 +321,15 @@ def _extract_and_save_data(
     extra_sheet_fields: Optional[dict] = None,
 ) -> Tuple[str, bool]:
     """
-    偵測 Claude 回覆中的 DATA_SAVE: {...}，寫入 Google Sheet。
+    偵測 AI 回覆中的 DATA_SAVE: {...}，寫入 Google Sheet。
+    支援英文冒號與中文全形冒號，使用括號平衡法提取 JSON。
     回傳 (清理後文字, 是否找到DATA_SAVE)
     """
-    pattern = r'DATA_SAVE:\s*(\{.*?\})'
-    match = re.search(pattern, raw_reply, re.DOTALL)
-    if not match:
+    json_str = _extract_json_object(raw_reply)
+    if not json_str:
+        logging.warning(f"[Engine] DATA_SAVE not found in reply (len={len(raw_reply)}), snippet={raw_reply[-200:]!r}")
         return raw_reply, False
 
-    json_str = match.group(1)
     try:
         data: dict = json.loads(json_str)
         fields = list(data.keys())
@@ -307,9 +341,10 @@ def _extract_and_save_data(
         except Exception as e:
             logging.warning(f"[Sheet] DATA_SAVE write failed: {e}")
     except json.JSONDecodeError as e:
-        logging.warning(f"[Engine] DATA_SAVE JSON parse error: {e} | raw={json_str[:100]}")
+        logging.warning(f"[Engine] DATA_SAVE JSON parse error: {e} | raw={json_str[:200]}")
 
-    cleaned = re.sub(r'\n?DATA_SAVE:\s*\{.*?\}\n?', '', raw_reply, flags=re.DOTALL).strip()
+    # 移除整個 DATA_SAVE 段落（含英文/中文冒號）
+    cleaned = re.sub(r'\n?DATA_SAVE\s*[:\uff1a]\s*\{.*?\}\n?', '', raw_reply, flags=re.DOTALL | re.IGNORECASE).strip()
     return cleaned, True
 
 
