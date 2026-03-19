@@ -22,7 +22,9 @@ async def send_instagram_message(recipient_id: str, text: str, page_access_token
             timeout=10.0
         )
         if resp.status_code != 200:
-            logging.warning(f"[Instagram] Send failed {resp.status_code}: {resp.text[:200]}")
+            logging.error(f"[Instagram] Send failed {resp.status_code}: {resp.text}")
+        else:
+            logging.info(f"[Instagram] Message sent successfully to {recipient_id}")
         return resp.status_code
 
 
