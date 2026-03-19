@@ -61,6 +61,7 @@ PLATFORM_RULES = """
 DATA_PARTIAL: {"已收集欄位1": "值1", "已收集欄位2": "值2"}
 注意：
 - 只輸出已收集到的欄位，尚未收集的不要放進去
+- JSON 必須非空（至少有一個欄位）；若尚未收集到任何資料，絕對不要輸出 DATA_PARTIAL
 - 每次有新資料都要重新輸出完整已收集內容（系統自動合併同一筆）
 - 輸出後繼續詢問下一個尚未收集的欄位
 
@@ -516,7 +517,7 @@ def generate_answer(
                     clean_reply = clean_reply + "\n\n" + off_hours_message
                     logging.info(f"[Engine] Off-hours message appended after DATA_SAVE")
         else:
-            clean_reply = re.sub(r'\n?DATA_SAVE:\s*\{.*?\}\n?', '', raw_reply, flags=re.DOTALL).strip()
+            clean_reply = re.sub(r'\n?DATA_(?:SAVE|PARTIAL):\s*\{.*?\}\n?', '', raw_reply, flags=re.DOTALL).strip()
 
         if session_id and session is not None:
             session["history"] = history + [
