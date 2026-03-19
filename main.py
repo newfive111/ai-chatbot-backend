@@ -150,9 +150,15 @@ def check_message_allowed(bot_id: str) -> tuple[bool, str]:
     return False, "此服務目前已暫停，如需繼續使用請聯絡我們。"
 
 
+class CreateBotRequest(BaseModel):
+    system_prompt: Optional[str] = None
+    collect_fields: Optional[list] = None
+    welcome_message: Optional[str] = None
+
 @app.post("/bots")
 async def create_bot(
     name: str,
+    body: CreateBotRequest = CreateBotRequest(),
     authorization: Optional[str] = Header(None)
 ):
     user_id = get_user_id(authorization)
@@ -167,11 +173,14 @@ async def create_bot(
         raise HTTPException(403, f"已達上限（{max_bots} 個 Bot）。請至定價頁購買更多名額。")
 
     bot_id = generate_bot_id()
-    supabase.table("bots").insert({
-        "id": bot_id,
-        "user_id": user_id,
-        "name": name
-    }).execute()
+    insert_data: dict = {"id": bot_id, "user_id": user_id, "name": name}
+    if body.system_prompt is not None:
+        insert_data["system_prompt"] = body.system_prompt
+    if body.collect_fields is not None:
+        insert_data["collect_fields"] = body.collect_fields
+    if body.welcome_message is not None:
+        insert_data["welcome_message"] = body.welcome_message
+    supabase.table("bots").insert(insert_data).execute()
     return {"bot_id": bot_id, "name": name}
 
 @app.get("/bots")
