@@ -111,6 +111,48 @@ def upsert_row(
         logging.info(f"[Sheet] new row → {display_key}")
 
 
+def update_extra_fields(
+    sheet_id: str,
+    session_id: str,
+    extra_fields: Dict[str, str],
+    display_name: str = None,
+):
+    """
+    對既有行的特定欄位做 non-destructive update（不覆蓋其他已有資料）。
+    用於在 DATA_SAVE 後補寫對話摘要等欄位。
+    """
+    sheet = get_sheet(sheet_id)
+    extra_keys = list(extra_fields.keys())
+    headers = ensure_headers(sheet, [], extra_fields=extra_keys)
+
+    display_key = display_name if display_name else session_id
+    col_a = sheet.col_values(1)
+    row_index = None
+    if display_key in col_a:
+        row_index = col_a.index(display_key) + 1
+    elif display_name and session_id in col_a:
+        row_index = col_a.index(session_id) + 1
+
+    if row_index is None:
+        logging.warning(f"[Sheet] Row not found for {display_key}, skip update_extra_fields")
+        return
+
+    now = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+    # 讀取現有 row，避免覆蓋其他欄位
+    current = sheet.row_values(row_index)
+    while len(current) < len(headers):
+        current.append("")
+
+    for field, value in extra_fields.items():
+        if field in headers:
+            current[headers.index(field)] = value
+    if "更新時間" in headers:
+        current[headers.index("更新時間")] = now
+
+    sheet.update(f"A{row_index}", [current])
+    logging.info(f"[Sheet] extra_fields updated for {display_key}: {list(extra_fields.keys())}")
+
+
 def append_row(sheet_id: str, fields: List[str], data: Dict[str, str]):
     """舊版相容：直接新增一行（不含 session_id）"""
     sheet = get_sheet(sheet_id)

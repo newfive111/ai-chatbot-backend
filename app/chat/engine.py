@@ -325,8 +325,8 @@ def _extract_json_object(text: str, marker: str = "DATA_SAVE") -> Optional[tuple
     return None
 
 
-def _write_data_to_sheet(json_str: str, sheet_id: str, session_id: str, marker: str, extra_sheet_fields: Optional[dict]):
-    """解析 JSON 並寫入 Sheet，失敗時只 log warning。"""
+def _write_data_to_sheet(json_str: str, sheet_id: str, session_id: str, marker: str, extra_sheet_fields: Optional[dict]) -> Optional[str]:
+    """解析 JSON 並寫入 Sheet，失敗時只 log warning。回傳 display_name（或 None）。"""
     try:
         data: dict = json.loads(json_str)
         fields = list(data.keys())
@@ -334,10 +334,12 @@ def _write_data_to_sheet(json_str: str, sheet_id: str, session_id: str, marker: 
         display_name = _get_display_name(data)
         upsert_row(sheet_id, session_id, fields, data, display_name=display_name, extra_fields=extra_sheet_fields)
         logging.info(f"[Sheet] {marker} written session={session_id[:8]} fields={fields}")
+        return display_name
     except json.JSONDecodeError as e:
         logging.warning(f"[Engine] {marker} JSON parse error: {e} | raw={json_str[:200]}")
     except Exception as e:
         logging.warning(f"[Sheet] {marker} write failed: {e}")
+    return None
 
 
 def _extract_and_save_data(
@@ -345,16 +347,17 @@ def _extract_and_save_data(
     sheet_id: str,
     session_id: str,
     extra_sheet_fields: Optional[dict] = None,
-) -> Tuple[str, bool]:
+) -> Tuple[str, bool, Optional[str]]:
     """
     偵測 AI 回覆中的資料標記，寫入 Google Sheet。
     - DATA_PARTIAL: {...} → 部分存檔，不觸發 handed_off
     - DATA_SAVE: {...}    → 完整存檔，觸發 handed_off（靜默）
     支援英文冒號與中文全形冒號，使用括號平衡法提取 JSON。
-    回傳 (清理後文字, 是否找到DATA_SAVE[最終完成])
+    回傳 (清理後文字, 是否找到DATA_SAVE, display_name)
     """
     cleaned = raw_reply
     found_final = False
+    saved_display_name: Optional[str] = None
 
     def _strip_marker(text: str, result: tuple) -> str:
         """用精確位置移除 marker 段落，避免 regex 截斷問題。"""
@@ -377,14 +380,40 @@ def _extract_and_save_data(
     # ── 處理 DATA_SAVE（完整資料，觸發靜默）──
     final_result = _extract_json_object(cleaned, marker="DATA_SAVE")
     if final_result:
-        _write_data_to_sheet(final_result[0], sheet_id, session_id, "DATA_SAVE", extra_sheet_fields)
+        saved_display_name = _write_data_to_sheet(final_result[0], sheet_id, session_id, "DATA_SAVE", extra_sheet_fields)
         cleaned = _strip_marker(cleaned, final_result)
         found_final = True
 
     if not partial_result and not final_result:
         logging.debug(f"[Engine] No data marker in reply (len={len(raw_reply)})")
 
-    return cleaned, found_final
+    return cleaned, found_final, saved_display_name
+
+
+def _generate_conversation_summary(api_key: str, history: list, last_question: str) -> str:
+    """用 AI 生成一句話對話摘要（30字以內）。失敗時回傳空字串。"""
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        lines = []
+        for m in (history or []):
+            role = "客戶" if m.get("role") == "user" else "AI"
+            lines.append(f"{role}：{str(m.get('content', ''))[:120]}")
+        lines.append(f"客戶：{last_question[:120]}")
+        conversation_text = "\n".join(lines[-20:])  # 最多 20 輪
+
+        prompt = (
+            "以下是一段客服對話，請用一句話（30字以內）摘要客戶的主要需求或情況。"
+            "只輸出摘要本身，不要加任何前綴或標點說明：\n\n"
+            f"{conversation_text}"
+        )
+        response = model.generate_content(prompt)
+        return (response.text or "").strip()[:60]
+    except Exception as e:
+        logging.warning(f"[Engine] Summary generation failed: {e}")
+        return ""
 
 
 # ──────────────────────────────────────
@@ -469,10 +498,19 @@ def generate_answer(
             raw_reply = _call_ai(api_key, system_prompt, history, question)
 
         if sheet_id and session_id:
-            clean_reply, data_saved = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
+            clean_reply, data_saved, saved_display_name = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
             if data_saved:
                 session["status"] = "handed_off"
                 logging.info(f"[Engine] {session_id[:8]} → handed_off (DATA_SAVE)")
+                # 對話摘要：非同步補寫到試算表
+                try:
+                    summary = _generate_conversation_summary(api_key, history, question)
+                    if summary:
+                        from app.sheets.client import update_extra_fields
+                        update_extra_fields(sheet_id, session_id, {"對話摘要": summary}, display_name=saved_display_name)
+                        logging.info(f"[Engine] Summary written for {session_id[:8]}: {summary[:30]}")
+                except Exception as _e:
+                    logging.warning(f"[Engine] Summary write failed: {_e}")
                 # 下班時間：資料收完後附上通知
                 if _is_off_hours and off_hours_message:
                     clean_reply = clean_reply + "\n\n" + off_hours_message
