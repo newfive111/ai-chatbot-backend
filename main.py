@@ -853,7 +853,7 @@ async def get_conversations(
 # ──────────────────────────────────────
 
 # ── 通用 Instagram Webhook（Meta App 層級，不帶 bot_id）──
-IG_VERIFY_TOKEN = "ldh_verify_token"
+IG_VERIFY_TOKEN = os.getenv("IG_VERIFY_TOKEN", "ldh_verify_token")
 
 @app.get("/instagram/webhook")
 async def instagram_webhook_verify_global(
