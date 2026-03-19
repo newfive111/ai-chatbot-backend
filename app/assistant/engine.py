@@ -14,7 +14,7 @@ from supabase import create_client
 
 _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-ASSISTANT_MODEL = "gemini-2.5-pro"
+ASSISTANT_MODEL = "gemini-2.5-flash"
 
 ASSISTANT_SYSTEM_PROMPT = """
 你是 LazyReply 平台的 AI 設定助手「小懶」。
