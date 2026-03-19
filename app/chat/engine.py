@@ -54,16 +54,24 @@ PLATFORM_RULES = """
 永遠以真人客服身份回覆，用繁體中文，語氣親切自然。
 
 【資料儲存規則 - 最高優先】
-當你確認已收集到角色設定中所有必要欄位的資料後：
-1. 先列出所有已收集的資料摘要，詢問客人「請問以上資料是否正確？如需修改請告訴我，確認後我幫您完成登記。」
-2. 等客人明確確認（說「對」「正確」「沒問題」「確認」等）後，才在回覆末尾另起一行輸出：
-DATA_SAVE: {"欄位名稱1": "值1", "欄位名稱2": "值2"}
+收集資料分兩個階段：
+
+階段一：收集中（每收到一個欄位立即觸發）
+每當客人提供任何欄位資料時，立即在回覆末尾另起一行輸出：
+DATA_PARTIAL: {"已收集欄位1": "值1", "已收集欄位2": "值2"}
 注意：
-- 必須是合法 JSON 格式，字串用雙引號
-- 鍵名使用原始欄位名稱（例如：姓名、電話、服務項目）
-- 客人未確認前絕對不能輸出 DATA_SAVE
-- 客人說要修改 → 更新欄位後重新列出摘要再次詢問確認
-- 輸出後立刻加上完成語（見下方）
+- 只輸出已收集到的欄位，尚未收集的不要放進去
+- 每次有新資料都要重新輸出完整已收集內容（系統自動合併同一筆）
+- 輸出後繼續詢問下一個尚未收集的欄位
+
+階段二：全部完成（所有欄位都收集到後）
+列出所有資料摘要，詢問客人「請問以上資料是否正確？確認後我幫您完成登記。」
+等客人明確確認後，改輸出：
+DATA_SAVE: {"所有欄位1": "值1", "所有欄位2": "值2"}
+注意：
+- DATA_SAVE 代表收集完成，只在客人確認後才輸出
+- 客人說要修改 → 更新後重新列摘要確認，輸出 DATA_PARTIAL 紀錄修改
+- 格式規定：合法 JSON，字串用雙引號，鍵名用原始欄位名稱
 
 【DATA_SAVE 完成交接語】
 輸出 DATA_SAVE 後，必須在同一則訊息加上一句簡短的完成語，告知客戶資料已登記完成、稍候聯繫。語氣符合你的角色設定，不要提及「主管」「專員」等詞語，除非角色設定中有特別說明。
@@ -280,13 +288,13 @@ def _get_display_name(data: dict) -> str:
     return None
 
 
-def _extract_json_object(text: str) -> Optional[str]:
+def _extract_json_object(text: str, marker: str = "DATA_SAVE") -> Optional[str]:
     """
-    從 DATA_SAVE: 或 DATA_SAVE： 之後提取完整 JSON 物件。
+    從指定 marker（DATA_SAVE 或 DATA_PARTIAL）之後提取完整 JSON 物件。
     使用括號平衡法，正確處理巢狀結構與字串內的括號。
     支援英文冒號 ':' 和中文全形冒號 '：'。
     """
-    m = re.search(r'DATA_SAVE\s*[:\uff1a]\s*(\{)', text, re.IGNORECASE)
+    m = re.search(rf'{re.escape(marker)}\s*[:\uff1a]\s*(\{{)', text, re.IGNORECASE)
     if not m:
         return None
     start = m.start(1)
@@ -314,6 +322,21 @@ def _extract_json_object(text: str) -> Optional[str]:
     return None
 
 
+def _write_data_to_sheet(json_str: str, sheet_id: str, session_id: str, marker: str, extra_sheet_fields: Optional[dict]):
+    """解析 JSON 並寫入 Sheet，失敗時只 log warning。"""
+    try:
+        data: dict = json.loads(json_str)
+        fields = list(data.keys())
+        from app.sheets.client import upsert_row
+        display_name = _get_display_name(data)
+        upsert_row(sheet_id, session_id, fields, data, display_name=display_name, extra_fields=extra_sheet_fields)
+        logging.info(f"[Sheet] {marker} written session={session_id[:8]} fields={fields}")
+    except json.JSONDecodeError as e:
+        logging.warning(f"[Engine] {marker} JSON parse error: {e} | raw={json_str[:200]}")
+    except Exception as e:
+        logging.warning(f"[Sheet] {marker} write failed: {e}")
+
+
 def _extract_and_save_data(
     raw_reply: str,
     sheet_id: str,
@@ -321,31 +344,32 @@ def _extract_and_save_data(
     extra_sheet_fields: Optional[dict] = None,
 ) -> Tuple[str, bool]:
     """
-    偵測 AI 回覆中的 DATA_SAVE: {...}，寫入 Google Sheet。
+    偵測 AI 回覆中的資料標記，寫入 Google Sheet。
+    - DATA_PARTIAL: {...} → 部分存檔，不觸發 handed_off
+    - DATA_SAVE: {...}    → 完整存檔，觸發 handed_off（靜默）
     支援英文冒號與中文全形冒號，使用括號平衡法提取 JSON。
-    回傳 (清理後文字, 是否找到DATA_SAVE)
+    回傳 (清理後文字, 是否找到DATA_SAVE[最終完成])
     """
-    json_str = _extract_json_object(raw_reply)
-    if not json_str:
-        logging.warning(f"[Engine] DATA_SAVE not found in reply (len={len(raw_reply)}), snippet={raw_reply[-200:]!r}")
-        return raw_reply, False
+    cleaned = raw_reply
+    found_final = False
 
-    try:
-        data: dict = json.loads(json_str)
-        fields = list(data.keys())
-        try:
-            from app.sheets.client import upsert_row
-            display_name = _get_display_name(data)
-            upsert_row(sheet_id, session_id, fields, data, display_name=display_name, extra_fields=extra_sheet_fields)
-            logging.info(f"[Sheet] DATA_SAVE written session={session_id[:8]} fields={fields}")
-        except Exception as e:
-            logging.warning(f"[Sheet] DATA_SAVE write failed: {e}")
-    except json.JSONDecodeError as e:
-        logging.warning(f"[Engine] DATA_SAVE JSON parse error: {e} | raw={json_str[:200]}")
+    # ── 處理 DATA_PARTIAL（部分資料，不靜默）──
+    partial_json = _extract_json_object(raw_reply, marker="DATA_PARTIAL")
+    if partial_json:
+        _write_data_to_sheet(partial_json, sheet_id, session_id, "DATA_PARTIAL", extra_sheet_fields)
+        cleaned = re.sub(r'\n?DATA_PARTIAL\s*[:\uff1a]\s*\{.*?\}\n?', '', cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
 
-    # 移除整個 DATA_SAVE 段落（含英文/中文冒號）
-    cleaned = re.sub(r'\n?DATA_SAVE\s*[:\uff1a]\s*\{.*?\}\n?', '', raw_reply, flags=re.DOTALL | re.IGNORECASE).strip()
-    return cleaned, True
+    # ── 處理 DATA_SAVE（完整資料，觸發靜默）──
+    final_json = _extract_json_object(cleaned, marker="DATA_SAVE")
+    if final_json:
+        _write_data_to_sheet(final_json, sheet_id, session_id, "DATA_SAVE", extra_sheet_fields)
+        cleaned = re.sub(r'\n?DATA_SAVE\s*[:\uff1a]\s*\{.*?\}\n?', '', cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+        found_final = True
+
+    if not partial_json and not final_json:
+        logging.warning(f"[Engine] No data marker found in reply (len={len(raw_reply)}), snippet={raw_reply[-200:]!r}")
+
+    return cleaned, found_final
 
 
 # ──────────────────────────────────────
