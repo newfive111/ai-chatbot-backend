@@ -231,6 +231,8 @@ class UpdateBotRequest(BaseModel):
     instagram_page_token: Optional[str] = None
     # 防抖
     debounce_seconds: Optional[int] = None
+    # 下班時間
+    off_hours_message: Optional[str] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -412,7 +414,7 @@ async def chat(bot_id: str, body: ChatRequest):
 
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, "
-        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers"
+        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, off_hours_message"
     ).eq("id", bot_id).execute()
     bot_data = result.data[0] if result.data else {}
     bot_name = bot_data.get("name", "AI 助理")
@@ -424,6 +426,7 @@ async def chat(bot_id: str, body: ChatRequest):
     slot_duration = bot_data.get("slot_duration_minutes") or 60
     business_hours = bot_data.get("business_hours") or None
     keyword_triggers = bot_data.get("keyword_triggers") or None
+    off_hours_message = bot_data.get("off_hours_message") or None
 
     try:
         answer = generate_answer(
@@ -437,6 +440,7 @@ async def chat(bot_id: str, body: ChatRequest):
             slot_duration_minutes=slot_duration,
             business_hours=business_hours,
             keyword_triggers=keyword_triggers,
+            off_hours_message=off_hours_message,
         )
     except Exception as e:
         if "NO_API_KEY" in str(e):
@@ -466,7 +470,7 @@ def _get_bot_config(bot_id: str) -> dict:
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, quick_replies, "
         "line_channel_secret, line_channel_access_token, "
         "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds, "
-        "instagram_page_token, instagram_account_id, facebook_page_id"
+        "instagram_page_token, instagram_account_id, facebook_page_id, off_hours_message"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
@@ -501,7 +505,8 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
         calendar_id    = bot.get("calendar_id") or None
         slot_duration  = bot.get("slot_duration_minutes") or 60
         business_hours = bot.get("business_hours") or None
-        keyword_triggers = bot.get("keyword_triggers") or None
+        keyword_triggers  = bot.get("keyword_triggers") or None
+        off_hours_message = bot.get("off_hours_message") or None
 
         # 抓 LINE 暱稱，存入試算表方便對應聊天室
         line_display_name = ""
@@ -532,6 +537,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
                 business_hours=business_hours,
                 keyword_triggers=keyword_triggers,
                 extra_sheet_fields=extra_sheet,
+                off_hours_message=off_hours_message,
             )
         except Exception as e:
             if "NO_API_KEY" in str(e):

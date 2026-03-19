@@ -409,9 +409,36 @@ def generate_answer(
     keyword_triggers: Optional[list] = None,
     # 額外寫入試算表的欄位（如 LINE暱稱）
     extra_sheet_fields: Optional[dict] = None,
+    # 下班時間自動回應
+    off_hours_message: Optional[str] = None,
 ) -> str:
     if not api_key:
         raise Exception("NO_API_KEY")
+
+    # ── 下班時間：第一次接觸時回固定訊息，後續正常服務 ──
+    if off_hours_message and session_id:
+        from datetime import datetime, timezone, timedelta
+        TZ = timezone(timedelta(hours=8))
+        now = datetime.now(TZ)
+        bh = business_hours or {}
+        weekdays = bh.get("weekdays", [1, 2, 3, 4, 5])
+        start    = bh.get("start", "09:00")
+        end      = bh.get("end", "18:00")
+        cur_time = now.strftime("%H:%M")
+        is_off   = now.isoweekday() not in weekdays or not (start <= cur_time <= end)
+        if is_off:
+            existing = session_store.get_session(session_id)
+            if not existing:
+                # 第一次接觸 → 回下班訊息，記入 session history
+                sess = session_store.get_or_create(session_id)
+                sess["history"] = [
+                    {"role": "user",      "content": question},
+                    {"role": "assistant", "content": off_hours_message},
+                ]
+                session_store.save(session_id, sess)
+                logging.info(f"[Engine] Off-hours reply for session {session_id[:8]}")
+                return off_hours_message
+            # 後續訊息 → 正常流程（已通知過）
 
     # ── 關鍵字觸發（最高優先，不耗 token）──
     if keyword_triggers:
