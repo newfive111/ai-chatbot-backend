@@ -415,30 +415,18 @@ def generate_answer(
     if not api_key:
         raise Exception("NO_API_KEY")
 
-    # ── 下班時間：第一次接觸時回固定訊息，後續正常服務 ──
-    if off_hours_message and session_id:
+    # ── 下班時間判斷（供後段使用）──
+    _is_off_hours = False
+    if off_hours_message:
         from datetime import datetime, timezone, timedelta
         TZ = timezone(timedelta(hours=8))
         now = datetime.now(TZ)
         bh = business_hours or {}
         weekdays = bh.get("weekdays", [1, 2, 3, 4, 5])
-        start    = bh.get("start", "09:00")
-        end      = bh.get("end", "18:00")
+        _start   = bh.get("start", "09:00")
+        _end     = bh.get("end", "18:00")
         cur_time = now.strftime("%H:%M")
-        is_off   = now.isoweekday() not in weekdays or not (start <= cur_time <= end)
-        if is_off:
-            existing = session_store.get_session(session_id)
-            if not existing:
-                # 第一次接觸 → 回下班訊息，記入 session history
-                sess = session_store.get_or_create(session_id)
-                sess["history"] = [
-                    {"role": "user",      "content": question},
-                    {"role": "assistant", "content": off_hours_message},
-                ]
-                session_store.save(session_id, sess)
-                logging.info(f"[Engine] Off-hours reply for session {session_id[:8]}")
-                return off_hours_message
-            # 後續訊息 → 正常流程（已通知過）
+        _is_off_hours = now.isoweekday() not in weekdays or not (_start <= cur_time <= _end)
 
     # ── 關鍵字觸發（最高優先，不耗 token）──
     if keyword_triggers:
@@ -485,6 +473,10 @@ def generate_answer(
             if data_saved:
                 session["status"] = "handed_off"
                 logging.info(f"[Engine] {session_id[:8]} → handed_off (DATA_SAVE)")
+                # 下班時間：資料收完後附上通知
+                if _is_off_hours and off_hours_message:
+                    clean_reply = clean_reply + "\n\n" + off_hours_message
+                    logging.info(f"[Engine] Off-hours message appended after DATA_SAVE")
         else:
             clean_reply = re.sub(r'\n?DATA_SAVE:\s*\{.*?\}\n?', '', raw_reply, flags=re.DOTALL).strip()
 
