@@ -288,16 +288,18 @@ def _get_display_name(data: dict) -> str:
     return None
 
 
-def _extract_json_object(text: str, marker: str = "DATA_SAVE") -> Optional[str]:
+def _extract_json_object(text: str, marker: str = "DATA_SAVE") -> Optional[tuple]:
     """
     從指定 marker（DATA_SAVE 或 DATA_PARTIAL）之後提取完整 JSON 物件。
     使用括號平衡法，正確處理巢狀結構與字串內的括號。
     支援英文冒號 ':' 和中文全形冒號 '：'。
+    回傳 (json_str, marker_start, json_end) 或 None。
     """
     m = re.search(rf'{re.escape(marker)}\s*[:\uff1a]\s*(\{{)', text, re.IGNORECASE)
     if not m:
         return None
-    start = m.start(1)
+    marker_start = m.start()   # marker 開始位置（含 DATA_PARTIAL/DATA_SAVE）
+    start = m.start(1)         # { 的位置
     depth = 0
     in_str = False
     escape = False
@@ -318,7 +320,8 @@ def _extract_json_object(text: str, marker: str = "DATA_SAVE") -> Optional[str]:
         elif c == '}':
             depth -= 1
             if depth == 0:
-                return text[start: start + i + 1]
+                json_end = start + i + 1
+                return text[start:json_end], marker_start, json_end
     return None
 
 
@@ -353,21 +356,33 @@ def _extract_and_save_data(
     cleaned = raw_reply
     found_final = False
 
+    def _strip_marker(text: str, result: tuple) -> str:
+        """用精確位置移除 marker 段落，避免 regex 截斷問題。"""
+        json_str, marker_start, json_end = result
+        # 移除前後的換行
+        start = marker_start
+        end = json_end
+        if start > 0 and text[start - 1] == '\n':
+            start -= 1
+        if end < len(text) and text[end] == '\n':
+            end += 1
+        return (text[:start] + text[end:]).strip()
+
     # ── 處理 DATA_PARTIAL（部分資料，不靜默）──
-    partial_json = _extract_json_object(raw_reply, marker="DATA_PARTIAL")
-    if partial_json:
-        _write_data_to_sheet(partial_json, sheet_id, session_id, "DATA_PARTIAL", extra_sheet_fields)
-        cleaned = re.sub(r'\n?DATA_PARTIAL\s*[:\uff1a]\s*\{.*?\}\n?', '', cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+    partial_result = _extract_json_object(raw_reply, marker="DATA_PARTIAL")
+    if partial_result:
+        _write_data_to_sheet(partial_result[0], sheet_id, session_id, "DATA_PARTIAL", extra_sheet_fields)
+        cleaned = _strip_marker(cleaned, partial_result)
 
     # ── 處理 DATA_SAVE（完整資料，觸發靜默）──
-    final_json = _extract_json_object(cleaned, marker="DATA_SAVE")
-    if final_json:
-        _write_data_to_sheet(final_json, sheet_id, session_id, "DATA_SAVE", extra_sheet_fields)
-        cleaned = re.sub(r'\n?DATA_SAVE\s*[:\uff1a]\s*\{.*?\}\n?', '', cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+    final_result = _extract_json_object(cleaned, marker="DATA_SAVE")
+    if final_result:
+        _write_data_to_sheet(final_result[0], sheet_id, session_id, "DATA_SAVE", extra_sheet_fields)
+        cleaned = _strip_marker(cleaned, final_result)
         found_final = True
 
-    if not partial_json and not final_json:
-        logging.warning(f"[Engine] No data marker found in reply (len={len(raw_reply)}), snippet={raw_reply[-200:]!r}")
+    if not partial_result and not final_result:
+        logging.debug(f"[Engine] No data marker in reply (len={len(raw_reply)})")
 
     return cleaned, found_final
 
