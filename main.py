@@ -303,6 +303,24 @@ async def update_bot(
     return {"message": "更新成功"}
 
 
+@app.delete("/bots/{bot_id}")
+async def delete_bot(bot_id: str, authorization: Optional[str] = Header(None)):
+    """刪除 bot（包含相關的 knowledge、sessions、conversations）"""
+    user_id = get_user_id(authorization)
+    # 驗證 bot 屬於該 user
+    bot = supabase.table("bots").select("user_id").eq("id", bot_id).execute()
+    if not bot.data or bot.data[0]["user_id"] != user_id:
+        raise HTTPException(403, "無權刪除此 Bot")
+
+    # 刪除關聯資料
+    supabase.table("knowledge_chunks").delete().eq("bot_id", bot_id).execute()
+    supabase.table("sessions").delete().eq("bot_id", bot_id).execute()
+    supabase.table("conversations").delete().eq("bot_id", bot_id).execute()
+    # 刪除 bot 本身
+    supabase.table("bots").delete().eq("id", bot_id).execute()
+    return {"status": "deleted"}
+
+
 # ──────────────────────────────────────
 # 知識庫上傳
 # ──────────────────────────────────────
