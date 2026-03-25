@@ -22,6 +22,10 @@ from supabase import create_client
 app = FastAPI(title="AI Chatbot SaaS API")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "2026-03-25-v2", "delete_endpoint_loaded": True}
+
 # ──────────────────────────────────────
 # LINE Bot 狀態管理（in-memory）
 # ──────────────────────────────────────
