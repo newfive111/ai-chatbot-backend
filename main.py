@@ -318,12 +318,16 @@ async def delete_bot(bot_id: str, authorization: Optional[str] = Header(None)):
         raise HTTPException(403, "無權刪除此 Bot")
 
     # 刪除關聯資料
-    supabase.table("knowledge_chunks").delete().eq("bot_id", bot_id).execute()
-    supabase.table("sessions").delete().eq("bot_id", bot_id).execute()
-    supabase.table("conversations").delete().eq("bot_id", bot_id).execute()
-    # 刪除 bot 本身
-    supabase.table("bots").delete().eq("id", bot_id).execute()
-    return {"status": "deleted"}
+    try:
+        supabase.table("knowledge_chunks").delete().eq("bot_id", bot_id).execute()
+        supabase.table("sessions").delete().eq("bot_id", bot_id).execute()
+        supabase.table("conversations").delete().eq("bot_id", bot_id).execute()
+        # 刪除 bot 本身
+        supabase.table("bots").delete().eq("id", bot_id).execute()
+        return {"status": "deleted"}
+    except Exception as e:
+        logging.error(f"[Delete Bot] Failed to delete bot {bot_id}: {e}")
+        raise HTTPException(500, f"刪除失敗: {str(e)}")
 
 
 # ──────────────────────────────────────
