@@ -320,7 +320,6 @@ async def delete_bot(bot_id: str, authorization: Optional[str] = Header(None)):
     # 刪除關聯資料
     try:
         supabase.table("knowledge_chunks").delete().eq("bot_id", bot_id).execute()
-        supabase.table("sessions").delete().eq("bot_id", bot_id).execute()
         supabase.table("conversations").delete().eq("bot_id", bot_id).execute()
         # 刪除 bot 本身
         supabase.table("bots").delete().eq("id", bot_id).execute()
