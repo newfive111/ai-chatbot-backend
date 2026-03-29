@@ -63,16 +63,13 @@ def build_checkout_params(
         "Version":      "2.0",
         "MerOrderNo":   order_no,
         "Amt":          str(amount),
-        "ItemDesc":     item_desc[:50],   # 最多 50 字元
-        "TradeLimit":   "900",            # 付款時限 900 秒
+        "ItemDesc":     item_desc[:50],
+        "TradeLimit":   "900",
         "ReturnURL":    return_url,
         "NotifyURL":    notify_url,
         "Email":        email,
         "EmailModify":  "0",
-        "LoginType":    "0",
-        "CREDIT":       "1",              # 信用卡
-        "VACC":         "1",              # ATM 轉帳
-        "CVS":          "1",              # 超商代碼
+        "CREDIT":       "1",
     }
 
     trade_info_str = urllib.parse.urlencode(params)

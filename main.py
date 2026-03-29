@@ -1148,9 +1148,9 @@ def _plan_to_amount(plan: str, annual: bool) -> int:
     return PRICE_BOT_ANNUAL if annual else PRICE_BOT_MONTHLY
 
 def _plan_to_desc(plan: str, annual: bool) -> str:
-    cycle = "年付" if annual else "月付"
-    name  = "商業版" if plan == "business" else "Bot 訂閱"
-    return f"攬得回 {name}（{cycle}）"
+    cycle = "annual" if annual else "monthly"
+    name  = "Business" if plan == "business" else "Bot"
+    return f"LanDeHui {name} ({cycle})"
 
 def _make_order_no(user_id: str) -> str:
     """產生藍新訂單號（max 20 chars）：NP + 10位時間戳 + 8位user前綴"""
