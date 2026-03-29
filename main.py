@@ -25,7 +25,15 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "2026-03-25-v2", "delete_endpoint_loaded": True}
+    return {
+        "status": "ok",
+        "version": "2026-03-29-v1",
+        "delete_endpoint_loaded": True,
+        "newebpay_key_len": len(NEWEBPAY_HASH_KEY),
+        "newebpay_iv_len": len(NEWEBPAY_HASH_IV),
+        "newebpay_merchant": NEWEBPAY_MERCHANT_ID[:6] + "***",
+        "newebpay_sandbox": NEWEBPAY_SANDBOX,
+    }
 
 # ──────────────────────────────────────
 # LINE Bot 狀態管理（in-memory）
