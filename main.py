@@ -27,12 +27,39 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 async def health():
     return {
         "status": "ok",
-        "version": "2026-03-29-v1",
-        "delete_endpoint_loaded": True,
+        "version": "2026-03-29-v2",
         "newebpay_key_len": len(NEWEBPAY_HASH_KEY),
         "newebpay_iv_len": len(NEWEBPAY_HASH_IV),
-        "newebpay_merchant": NEWEBPAY_MERCHANT_ID[:6] + "***",
+        "newebpay_merchant": NEWEBPAY_MERCHANT_ID,
         "newebpay_sandbox": NEWEBPAY_SANDBOX,
+    }
+
+@app.get("/debug/checkout-test")
+async def debug_checkout():
+    """Debug: 產生測試付款參數，不建立訂單"""
+    from app.newebpay.payment import build_checkout_params, aes_decrypt
+    import urllib.parse
+    params = build_checkout_params(
+        merchant_id=NEWEBPAY_MERCHANT_ID,
+        hash_key=NEWEBPAY_HASH_KEY,
+        hash_iv=NEWEBPAY_HASH_IV,
+        order_no=f"TEST{int(time.time())}",
+        amount=100,
+        item_desc="Test Item",
+        email="test@test.com",
+        return_url="https://landehui.online/dashboard",
+        notify_url="https://api.landehui.online/newebpay/webhook",
+        sandbox=NEWEBPAY_SANDBOX,
+    )
+    # 解密驗證
+    try:
+        decrypted = aes_decrypt(params["TradeInfo"], NEWEBPAY_HASH_KEY, NEWEBPAY_HASH_IV)
+    except Exception as e:
+        decrypted = f"DECRYPT ERROR: {e}"
+    return {
+        "params": params,
+        "decrypted_trade_info": decrypted,
+        "merchant_id_match": params["MerchantID"] == NEWEBPAY_MERCHANT_ID,
     }
 
 # ──────────────────────────────────────
