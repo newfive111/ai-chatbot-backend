@@ -80,9 +80,9 @@ def build_checkout_params(
     trade_sha      = sha256_mac(trade_info, hash_key, hash_iv)
 
     if sandbox:
-        gateway_url = "https://ccore.spgateway.com/MPG/mpg_gateway"
+        gateway_url = "https://ccore.newebpay.com/MPG/mpg_gateway"
     else:
-        gateway_url = "https://core.spgateway.com/MPG/mpg_gateway"
+        gateway_url = "https://core.newebpay.com/MPG/mpg_gateway"
 
     return {
         "gateway_url": gateway_url,
