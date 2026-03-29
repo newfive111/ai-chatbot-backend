@@ -1256,7 +1256,7 @@ async def newebpay_webhook(request: Request):
         logging.warning("[NewebPay] Webhook ignored (invalid / non-success)")
         return {"status": "ignored"}
 
-    order_no = result.get("MerOrderNo", "")
+    order_no = result.get("MerchantOrderNo", "") or result.get("MerOrderNo", "")
     logging.info(f"[NewebPay] Payment success: order={order_no}")
 
     # 查訂單 → 找回 user_id / plan / slots

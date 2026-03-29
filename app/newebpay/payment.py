@@ -61,7 +61,7 @@ def build_checkout_params(
         "RespondType":  "JSON",
         "TimeStamp":    str(int(time.time())),
         "Version":      "2.0",
-        "MerOrderNo":   order_no,
+        "MerchantOrderNo": order_no,
         "Amt":          str(amount),
         "ItemDesc":     item_desc[:50],
         "TradeLimit":   "900",
