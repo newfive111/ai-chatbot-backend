@@ -158,6 +158,101 @@ def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> 
     return response.text
 
 
+def _call_ai_with_ziwei(
+    api_key: str,
+    system_prompt: str,
+    history: list,
+    question: str
+) -> str:
+    """呼叫 Gemini 2.5 Flash（含紫微排盤 Function Calling）"""
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+
+    tools = types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name="generate_ziwei_chart",
+            description="用客人提供的出生年月日、時辰、性別排出紫微斗數命盤。收集完生辰資料後立刻呼叫此工具。",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "solar_date": types.Schema(
+                        type=types.Type.STRING,
+                        description="國曆出生日期，格式 YYYY-M-D，例如 1990-1-15"
+                    ),
+                    "birth_hour": types.Schema(
+                        type=types.Type.INTEGER,
+                        description="出生時辰索引：0=子時(23-01), 1=丑時(01-03), 2=寅時(03-05), 3=卯時(05-07), 4=辰時(07-09), 5=巳時(09-11), 6=午時(11-13), 7=未時(13-15), 8=申時(15-17), 9=酉時(17-19), 10=戌時(19-21), 11=亥時(21-23)。若客人說幾點出生，換算成對應時辰索引。若客人不知道時辰，預設用 0（子時）並說明。"
+                    ),
+                    "gender": types.Schema(
+                        type=types.Type.STRING,
+                        description="性別：男 或 女"
+                    ),
+                },
+                required=["solar_date", "birth_hour", "gender"]
+            )
+        ),
+    ])
+
+    contents = []
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
+    contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
+
+    for _ in range(4):
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=[tools],
+                max_output_tokens=2048,
+            )
+        )
+        candidate = response.candidates[0]
+        contents.append(candidate.content)
+
+        fc_parts = [p for p in candidate.content.parts if p.function_call]
+        if not fc_parts:
+            return "".join(
+                p.text for p in candidate.content.parts if hasattr(p, "text") and p.text
+            ).strip() or "請提供您的出生資訊，我來為您排盤。"
+
+        tool_response_parts = []
+        for p in fc_parts:
+            fc = p.function_call
+            args = dict(fc.args) if fc.args else {}
+
+            try:
+                if fc.name == "generate_ziwei_chart":
+                    from app.fortune.ziwei import generate_chart
+                    chart = generate_chart(
+                        solar_date=args["solar_date"],
+                        birth_hour=int(args["birth_hour"]),
+                        gender=args["gender"],
+                    )
+                    result = chart if chart else "排盤失敗，請確認出生資訊是否正確。"
+                else:
+                    result = "未知工具"
+            except Exception as e:
+                result = f"排盤失敗：{str(e)[:80]}"
+
+            logging.info(f"[ZiWei] generate_chart → {len(result)} chars")
+            tool_response_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name=fc.name, response={"result": result}
+                    )
+                )
+            )
+
+        contents.append(types.Content(role="tool", parts=tool_response_parts))
+
+    return "排盤處理超時，請再試一次。"
+
+
 def _call_ai_with_calendar(
     api_key: str,
     system_prompt: str,
@@ -450,6 +545,8 @@ def generate_answer(
     extra_sheet_fields: Optional[dict] = None,
     # 下班時間自動回應
     off_hours_message: Optional[str] = None,
+    # 紫微斗數排盤
+    enable_ziwei: bool = False,
 ) -> str:
     if not api_key:
         raise Exception("NO_API_KEY")
@@ -498,11 +595,15 @@ def generate_answer(
             session = None
             history = []
 
-        # 有 calendar_id → 使用 Function Calling 版本
+        # 路徑選擇：calendar / ziwei / 純文字
         if has_calendar:
             raw_reply = _call_ai_with_calendar(
                 api_key, system_prompt, history, question,
                 calendar_id, slot_duration_minutes, _bh
+            )
+        elif enable_ziwei:
+            raw_reply = _call_ai_with_ziwei(
+                api_key, system_prompt, history, question
             )
         else:
             raw_reply = _call_ai(api_key, system_prompt, history, question)

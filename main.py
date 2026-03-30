@@ -194,6 +194,7 @@ class CreateBotRequest(BaseModel):
     system_prompt: Optional[str] = None
     collect_fields: Optional[list] = None
     welcome_message: Optional[str] = None
+    enable_ziwei: Optional[bool] = None
 
 @app.post("/bots")
 async def create_bot(
@@ -220,6 +221,8 @@ async def create_bot(
         insert_data["collect_fields"] = body.collect_fields
     if body.welcome_message is not None:
         insert_data["welcome_message"] = body.welcome_message
+    if body.enable_ziwei is not None:
+        insert_data["enable_ziwei"] = body.enable_ziwei
     supabase.table("bots").insert(insert_data).execute()
     return {"bot_id": bot_id, "name": name}
 
@@ -282,6 +285,8 @@ class UpdateBotRequest(BaseModel):
     debounce_seconds: Optional[int] = None
     # 下班時間
     off_hours_message: Optional[str] = None
+    # 紫微斗數
+    enable_ziwei: Optional[bool] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -484,7 +489,7 @@ async def chat(bot_id: str, body: ChatRequest):
 
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, "
-        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, off_hours_message"
+        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, off_hours_message, enable_ziwei"
     ).eq("id", bot_id).execute()
     bot_data = result.data[0] if result.data else {}
     bot_name = bot_data.get("name", "AI 助理")
@@ -497,6 +502,7 @@ async def chat(bot_id: str, body: ChatRequest):
     business_hours = bot_data.get("business_hours") or None
     keyword_triggers = bot_data.get("keyword_triggers") or None
     off_hours_message = bot_data.get("off_hours_message") or None
+    enable_ziwei = bot_data.get("enable_ziwei") or False
 
     try:
         answer = generate_answer(
@@ -511,6 +517,7 @@ async def chat(bot_id: str, body: ChatRequest):
             business_hours=business_hours,
             keyword_triggers=keyword_triggers,
             off_hours_message=off_hours_message,
+            enable_ziwei=enable_ziwei,
         )
     except Exception as e:
         if "NO_API_KEY" in str(e):
@@ -540,7 +547,7 @@ def _get_bot_config(bot_id: str) -> dict:
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, quick_replies, "
         "line_channel_secret, line_channel_access_token, "
         "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds, "
-        "instagram_page_token, instagram_account_id, facebook_page_id, off_hours_message"
+        "instagram_page_token, instagram_account_id, facebook_page_id, off_hours_message, enable_ziwei"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
@@ -577,6 +584,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
         business_hours = bot.get("business_hours") or None
         keyword_triggers  = bot.get("keyword_triggers") or None
         off_hours_message = bot.get("off_hours_message") or None
+        enable_ziwei      = bot.get("enable_ziwei") or False
 
         # 抓 LINE 暱稱，存入試算表方便對應聊天室
         line_display_name = ""
@@ -608,6 +616,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
                 keyword_triggers=keyword_triggers,
                 extra_sheet_fields=extra_sheet,
                 off_hours_message=off_hours_message,
+                enable_ziwei=enable_ziwei,
             )
         except Exception as e:
             if "NO_API_KEY" in str(e):
@@ -1067,6 +1076,7 @@ async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
         slot_duration  = bot.get("slot_duration_minutes") or 60
         business_hours = bot.get("business_hours") or None
         keyword_triggers = bot.get("keyword_triggers") or None
+        enable_ziwei     = bot.get("enable_ziwei") or False
         session_id     = f"ig_{bot_id}_{sender_id}"
 
         try:
@@ -1081,6 +1091,7 @@ async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
                 slot_duration_minutes=slot_duration,
                 business_hours=business_hours,
                 keyword_triggers=keyword_triggers,
+                enable_ziwei=enable_ziwei,
             )
         except Exception as e:
             if "NO_API_KEY" in str(e):
