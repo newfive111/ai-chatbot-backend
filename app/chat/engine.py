@@ -110,6 +110,12 @@ def _get_system_prompt(
     """
     組合最終 system prompt：[角色設定] + [知識庫] + [預約規則?] + [平台底層規則]
     """
+    from datetime import datetime, timezone, timedelta
+    TW = timezone(timedelta(hours=8))
+    now_tw = datetime.now(TW)
+    weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
+    date_info = f"\n\n【目前時間】{now_tw.strftime('%Y-%m-%d')} 星期{weekday_names[now_tw.weekday()]} {now_tw.strftime('%H:%M')}\n"
+
     role_section = custom_system_prompt.strip() if (custom_system_prompt and custom_system_prompt.strip()) \
                    else DEFAULT_ROLE_PROMPT.format(bot_name=bot_name)
 
@@ -121,7 +127,7 @@ def _get_system_prompt(
     if not has_sheet:
         rules = rules.split("【DATA_SAVE 完成交接語】")[0].rstrip()
 
-    return f"{role_section}{kb_section}{calendar_section}{rules}"
+    return f"{role_section}{date_info}{kb_section}{calendar_section}{rules}"
 
 
 # ──────────────────────────────────────
@@ -164,7 +170,10 @@ def _call_ai_with_calendar(
     """呼叫 Gemini 2.5 Flash（含預約 Function Calling）"""
     from google import genai
     from google.genai import types
-    from datetime import date as _date
+    from datetime import datetime, timezone, timedelta
+
+    TW = timezone(timedelta(hours=8))
+    today_tw = datetime.now(TW).strftime("%Y-%m-%d")
 
     client = genai.Client(api_key=api_key)
 
@@ -177,7 +186,7 @@ def _call_ai_with_calendar(
                 properties={
                     "date": types.Schema(
                         type=types.Type.STRING,
-                        description=f"日期，格式 YYYY-MM-DD，今天是 {_date.today().isoformat()}"
+                        description=f"日期，格式 YYYY-MM-DD，今天是 {today_tw}"
                     )
                 },
                 required=["date"]
