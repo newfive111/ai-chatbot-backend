@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /Users/lixianghe/ai-chatbot-saas/backend/main.py /Users/lixianghe/ai-chatbot-saas/backend/app/**/*.py)",
+      "Bash(python -c \":*)",
+      "Bash(python3 -c \":*)",
+      "Bash(source venv/bin/activate)",
+      "Bash(pip install:*)",
+      "Bash(timeout 5 python3 -m uvicorn main:app --host 127.0.0.1 --port 8999)",
+      "Bash(pip show:*)"
+    ]
+  }
+}
