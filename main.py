@@ -22,6 +22,8 @@ from supabase import create_client
 
 app = FastAPI(title="AI Chatbot SaaS API")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# 專用 admin client，永遠不呼叫 sign_in，避免 user session 污染 auth.admin.* 呼叫
+_admin = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @app.get("/health")
 async def health():
@@ -101,21 +103,31 @@ class LoginRequest(BaseModel):
 
 @app.post("/auth/register")
 async def register(body: RegisterRequest):
-    result = supabase.auth.admin.create_user({
-        "email": body.email,
-        "password": body.password,
-        "email_confirm": True
-    })
+    try:
+        result = _admin.auth.admin.create_user({
+            "email": body.email,
+            "password": body.password,
+            "email_confirm": True
+        })
+    except Exception as e:
+        err_str = str(e).lower()
+        if "already" in err_str or "exist" in err_str or "duplicate" in err_str:
+            raise HTTPException(400, "此 Email 已被註冊，請直接登入或換一個 Email")
+        if "password" in err_str:
+            raise HTTPException(400, "密碼強度不足，請使用至少 8 位包含英數字的密碼")
+        raise HTTPException(400, f"註冊失敗：{str(e)}")
     if result.user:
         created_at_str = result.user.created_at.isoformat() if result.user.created_at else ""
         token = create_token(result.user.id, email=result.user.email or "", created_at=created_at_str)
         return {"token": token, "user_id": result.user.id}
-    raise HTTPException(400, "註冊失敗")
+    raise HTTPException(400, "註冊失敗，請稍後再試")
 
 @app.post("/auth/login")
 async def login(body: LoginRequest):
+    # 每次登入用獨立 client，避免 user session 寫入共用 supabase client
+    _login_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     try:
-        result = supabase.auth.sign_in_with_password({
+        result = _login_client.auth.sign_in_with_password({
             "email": body.email,
             "password": body.password
         })
@@ -1386,11 +1398,13 @@ def root():
 # Admin
 # ──────────────────────────────────────
 
-ADMIN_EMAIL = "youfanliao444@gmail.com"
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "")
 
 def require_admin(authorization: str = None) -> str:
+    if not ADMIN_EMAIL:
+        raise HTTPException(503, "Admin not configured")
     user_id = get_user_id(authorization)
-    user_info = supabase.auth.admin.get_user_by_id(user_id)
+    user_info = _admin.auth.admin.get_user_by_id(user_id)
     if not user_info.user or user_info.user.email != ADMIN_EMAIL:
         raise HTTPException(403, "無權限")
     return user_id
@@ -1399,7 +1413,7 @@ def require_admin(authorization: str = None) -> str:
 @app.get("/admin/stats")
 async def admin_stats(authorization: Optional[str] = Header(None)):
     require_admin(authorization)
-    users = supabase.auth.admin.list_users()
+    users = _admin.auth.admin.list_users()
     total_users = len(users) if isinstance(users, list) else 0
     bots = supabase.table("bots").select("id", count="exact").execute()
 
@@ -1425,7 +1439,7 @@ async def admin_stats(authorization: Optional[str] = Header(None)):
 @app.get("/admin/users")
 async def admin_list_users(authorization: Optional[str] = Header(None)):
     require_admin(authorization)
-    users = supabase.auth.admin.list_users()
+    users = _admin.auth.admin.list_users()
     user_list = users if isinstance(users, list) else []
 
     # bot_subscriptions: 每個用戶的 active slots 總和
