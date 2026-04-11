@@ -7,10 +7,14 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def get_embedding(text: str, api_key: str) -> List[float]:
     """使用 Gemini text-embedding-004 產生真實語意向量（768 維）"""
-    from google import genai
-    client = genai.Client(api_key=api_key, http_options={"api_version": "v1"})
-    result = client.models.embed_content(model="text-embedding-004", contents=text)
-    return result.embeddings[0].values
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+    result = genai.embed_content(
+        model="models/text-embedding-004",
+        content=text,
+        task_type="retrieval_document"
+    )
+    return result["embedding"]
 
 
 def store_chunks(bot_id: str, chunks: List[str], api_key: str = "") -> bool:
