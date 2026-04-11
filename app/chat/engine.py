@@ -573,7 +573,7 @@ def generate_answer(
                 logging.info(f"[Engine] Keyword match: '{kw}'")
                 return kt.get("reply", "")
 
-    relevant_chunks = search_similar_chunks(bot_id, question, top_k=5)
+    relevant_chunks = search_similar_chunks(bot_id, question, top_k=5, api_key=api_key or "")
     context = "\n\n".join(relevant_chunks)
     has_calendar = bool(calendar_id)
     system_prompt = _get_system_prompt(

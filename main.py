@@ -392,16 +392,21 @@ async def upload_document(
     authorization: Optional[str] = Header(None)
 ):
     get_user_id(authorization)
-    content = await file.read()
+    bot_row = supabase.table("bots").select("anthropic_api_key").eq("id", bot_id).execute()
+    if not bot_row.data:
+        raise HTTPException(404, "Bot 不存在")
+    api_key = bot_row.data[0].get("anthropic_api_key", "")
+    if not api_key:
+        raise HTTPException(400, "請先在 Bot 設定中填入 Gemini API Key")
 
+    content = await file.read()
     if file.filename.endswith(".pdf"):
         text = extract_text_from_pdf(content)
     else:
         text = content.decode("utf-8")
 
     chunks = chunk_text(text)
-    store_chunks(bot_id, chunks)
-
+    store_chunks(bot_id, chunks, api_key=api_key)
     return {"message": f"成功上傳，共 {len(chunks)} 個知識塊"}
 
 class FAQRequest(BaseModel):
@@ -414,8 +419,15 @@ async def add_faq(
     authorization: Optional[str] = Header(None)
 ):
     get_user_id(authorization)
+    bot_row = supabase.table("bots").select("anthropic_api_key").eq("id", bot_id).execute()
+    if not bot_row.data:
+        raise HTTPException(404, "Bot 不存在")
+    api_key = bot_row.data[0].get("anthropic_api_key", "")
+    if not api_key:
+        raise HTTPException(400, "請先在 Bot 設定中填入 Gemini API Key")
+
     chunks = chunk_text(body.content)
-    store_chunks(bot_id, chunks)
+    store_chunks(bot_id, chunks, api_key=api_key)
     return {"message": "FAQ 已加入知識庫"}
 
 @app.get("/bots/{bot_id}/knowledge")
