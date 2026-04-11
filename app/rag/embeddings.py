@@ -6,11 +6,11 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def get_embedding(text: str, api_key: str) -> List[float]:
-    """使用 Gemini text-embedding-004 產生真實語意向量（768 維）"""
+    """使用 Gemini embedding-001 產生語意向量（768 維）"""
     import httpx
-    url = f"https://generativelanguage.googleapis.com/v1/models/text-embedding-004:embedContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/embedding-001:embedContent?key={api_key}"
     payload = {
-        "model": "models/text-embedding-004",
+        "model": "models/embedding-001",
         "content": {"parts": [{"text": text}]}
     }
     resp = httpx.post(url, json=payload, timeout=30)
