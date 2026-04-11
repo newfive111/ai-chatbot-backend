@@ -267,20 +267,34 @@ def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_ke
 
     # Function Calling 迴圈（最多 6 次工具呼叫）
     for iteration in range(6):
-        try:
-            response = client.models.generate_content(
-                model=ASSISTANT_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    tools=[tools],
-                    max_output_tokens=2048,
-                    temperature=0.7
+        response = None
+        last_err = None
+        for _attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=ASSISTANT_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        tools=[tools],
+                        max_output_tokens=2048,
+                        temperature=0.7
+                    )
                 )
-            )
-        except Exception as e:
-            logging.error(f"[Assistant] Gemini API error: {e}")
-            return f"⚠️ AI 服務暫時無法連線，請稍後再試。（{str(e)[:60]}）"
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if "503" in err_str or "overloaded" in err_str.lower() or "unavailable" in err_str.lower():
+                    wait = 3 * (_attempt + 1)
+                    logging.warning(f"[Assistant] Gemini 503，第 {_attempt+1} 次重試，等待 {wait}s")
+                    import time; time.sleep(wait)
+                else:
+                    break
+        if last_err is not None:
+            logging.error(f"[Assistant] Gemini API error: {last_err}")
+            return f"⚠️ AI 服務暫時無法連線，請稍後再試。（{str(last_err)[:60]}）"
 
         if not response.candidates:
             logging.error(f"[Assistant] Empty candidates from Gemini, prompt_feedback={getattr(response, 'prompt_feedback', None)}")

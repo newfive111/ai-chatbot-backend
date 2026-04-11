@@ -147,15 +147,27 @@ def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> 
         contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
     contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            max_output_tokens=1024,
-        ),
-    )
-    return response.text
+    import time as _time
+    last_err = None
+    for _attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    max_output_tokens=1024,
+                ),
+            )
+            return response.text
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if "503" in err_str or "overloaded" in err_str.lower() or "unavailable" in err_str.lower():
+                _time.sleep(3 * (_attempt + 1))
+            else:
+                raise
+    raise last_err
 
 
 def _call_ai_with_ziwei(
