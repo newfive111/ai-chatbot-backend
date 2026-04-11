@@ -278,7 +278,8 @@ def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_ke
                         system_instruction=system_prompt,
                         tools=[tools],
                         max_output_tokens=2048,
-                        temperature=0.7
+                        temperature=0.7,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
                     )
                 )
                 last_err = None

@@ -157,9 +157,13 @@ def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> 
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     max_output_tokens=1024,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             )
-            return response.text
+            # 只取非 thinking 的 text parts，避免思考過程外洩
+            parts = response.candidates[0].content.parts if response.candidates else []
+            text = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
+            return text or response.text
         except Exception as e:
             last_err = e
             err_str = str(e)
@@ -221,6 +225,7 @@ def _call_ai_with_ziwei(
                 system_instruction=system_prompt,
                 tools=[tools],
                 max_output_tokens=2048,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             )
         )
         candidate = response.candidates[0]
