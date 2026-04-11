@@ -5,24 +5,44 @@ from supabase import create_client
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+def _local_embedding(text: str) -> List[float]:
+    """
+    本地 feature-hashing 向量（768 維）。
+    用於 Gemini embedding API 無法存取時的備援。
+    相似文字因共享 token hash 而有相近的 cosine 相似度。
+    """
+    import hashlib, math
+    text = text.lower()
+    vec = [0.0] * 768
+    words = text.split()
+    for word in words:
+        idx = int(hashlib.md5(word.encode()).hexdigest(), 16) % 768
+        vec[idx] += 1.0
+    for i in range(len(words) - 1):
+        bigram = words[i] + "_" + words[i + 1]
+        idx = int(hashlib.md5(bigram.encode()).hexdigest(), 16) % 768
+        vec[idx] += 0.5
+    for i in range(len(text) - 2):
+        idx = int(hashlib.md5(text[i:i+3].encode()).hexdigest(), 16) % 768
+        vec[idx] += 0.3
+    magnitude = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / magnitude for x in vec]
+
+
 def get_embedding(text: str, api_key: str) -> List[float]:
-    """依序嘗試各 Gemini embedding 模型，回傳第一個成功的向量"""
+    """先嘗試 Gemini embedding API，失敗則用本地 hash 向量"""
     import httpx
-    candidates = [
-        ("v1beta", "text-embedding-005"),
-        ("v1beta", "text-embedding-004"),
-        ("v1",     "text-embedding-004"),
-    ]
-    payload = {"content": {"parts": [{"text": text}]}}
-    last_err = None
-    for version, model in candidates:
-        url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:embedContent?key={api_key}"
-        resp = httpx.post(url, json=payload, timeout=30)
-        print(f"[Embedding] {model}/{version}: {resp.status_code}", flush=True)
-        if resp.is_success and "embedding" in resp.json():
-            return resp.json()["embedding"]["values"]
-        last_err = f"{model}/{version} {resp.status_code}: {resp.text[:100]}"
-    raise ValueError(f"所有 Embedding 模型都失敗：{last_err}")
+    if api_key:
+        for version, model in [("v1beta", "text-embedding-005"), ("v1beta", "text-embedding-004")]:
+            try:
+                url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:embedContent?key={api_key}"
+                resp = httpx.post(url, json={"content": {"parts": [{"text": text}]}}, timeout=15)
+                if resp.is_success and "embedding" in resp.json():
+                    return resp.json()["embedding"]["values"]
+            except Exception:
+                pass
+    print("[Embedding] Gemini API 不可用，使用本地 hash 向量", flush=True)
+    return _local_embedding(text)
 
 
 def store_chunks(bot_id: str, chunks: List[str], api_key: str = "") -> bool:
