@@ -27,42 +27,7 @@ _admin = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "version": "2026-03-29-v2",
-        "newebpay_key_len": len(NEWEBPAY_HASH_KEY),
-        "newebpay_iv_len": len(NEWEBPAY_HASH_IV),
-        "newebpay_merchant": NEWEBPAY_MERCHANT_ID,
-        "newebpay_sandbox": NEWEBPAY_SANDBOX,
-    }
-
-@app.get("/debug/checkout-test")
-async def debug_checkout():
-    """Debug: 產生測試付款參數，不建立訂單"""
-    from app.newebpay.payment import build_checkout_params, aes_decrypt
-    import urllib.parse
-    params = build_checkout_params(
-        merchant_id=NEWEBPAY_MERCHANT_ID,
-        hash_key=NEWEBPAY_HASH_KEY,
-        hash_iv=NEWEBPAY_HASH_IV,
-        order_no=f"TEST{int(time.time())}",
-        amount=100,
-        item_desc="Test Item",
-        email="test@test.com",
-        return_url="https://landehui.online/dashboard",
-        notify_url="https://api.landehui.online/newebpay/webhook",
-        sandbox=NEWEBPAY_SANDBOX,
-    )
-    # 解密驗證
-    try:
-        decrypted = aes_decrypt(params["TradeInfo"], NEWEBPAY_HASH_KEY, NEWEBPAY_HASH_IV)
-    except Exception as e:
-        decrypted = f"DECRYPT ERROR: {e}"
-    return {
-        "params": params,
-        "decrypted_trade_info": decrypted,
-        "merchant_id_match": params["MerchantID"] == NEWEBPAY_MERCHANT_ID,
-    }
+    return {"status": "ok"}
 
 # ──────────────────────────────────────
 # LINE Bot 狀態管理（in-memory）
@@ -81,9 +46,10 @@ _SPAM_KEYWORDS = ["資金週轉", "債務整合", "房屋二胎", "汽機車二�
 DEBOUNCE_SECONDS = 15  # 防抖等待時間（LINE replyToken 60秒過期，15s 緩衝足夠安全）
 
 # 允許跨域（前端呼叫用）
+_allowed_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://www.landehui.online,https://landehui.online").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -385,6 +351,8 @@ async def delete_bot(bot_id: str, authorization: Optional[str] = Header(None)):
 # 知識庫上傳
 # ──────────────────────────────────────
 
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+
 @app.post("/bots/{bot_id}/upload")
 async def upload_document(
     bot_id: str,
@@ -400,13 +368,18 @@ async def upload_document(
         raise HTTPException(400, "請先在 Bot 設定中填入 Gemini API Key")
 
     content = await file.read()
-    if file.filename.endswith(".pdf"):
-        text = extract_text_from_pdf(content)
-    else:
-        text = content.decode("utf-8")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, f"檔案過大，上限為 10 MB")
 
-    chunks = chunk_text(text)
-    store_chunks(bot_id, chunks, api_key=api_key)
+    try:
+        if file.filename and file.filename.endswith(".pdf"):
+            text = extract_text_from_pdf(content)
+        else:
+            text = content.decode("utf-8")
+        chunks = chunk_text(text)
+        store_chunks(bot_id, chunks, api_key=api_key)
+    except Exception as e:
+        raise HTTPException(500, f"上傳失敗：{str(e)}")
     return {"message": f"成功上傳，共 {len(chunks)} 個知識塊"}
 
 class FAQRequest(BaseModel):
