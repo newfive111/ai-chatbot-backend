@@ -8,7 +8,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 def get_embedding(text: str, api_key: str) -> List[float]:
     """使用 Gemini text-embedding-004 產生真實語意向量（768 維）"""
     from google import genai
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={"api_version": "v1"})
     result = client.models.embed_content(model="text-embedding-004", contents=text)
     return result.embeddings[0].values
 
