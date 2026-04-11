@@ -427,7 +427,10 @@ async def add_faq(
         raise HTTPException(400, "請先在 Bot 設定中填入 Gemini API Key")
 
     chunks = chunk_text(body.content)
-    store_chunks(bot_id, chunks, api_key=api_key)
+    try:
+        store_chunks(bot_id, chunks, api_key=api_key)
+    except Exception as e:
+        raise HTTPException(500, f"Embedding 失敗：{str(e)}")
     return {"message": "FAQ 已加入知識庫"}
 
 @app.get("/bots/{bot_id}/knowledge")
