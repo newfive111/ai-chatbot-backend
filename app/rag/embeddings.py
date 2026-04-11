@@ -6,16 +6,23 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def get_embedding(text: str, api_key: str) -> List[float]:
-    """使用 Gemini embedding-001 產生語意向量（768 維）"""
+    """依序嘗試各 Gemini embedding 模型，回傳第一個成功的向量"""
     import httpx
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/embedding-001:embedContent?key={api_key}"
-    payload = {
-        "content": {"parts": [{"text": text}]}
-    }
-    resp = httpx.post(url, json=payload, timeout=30)
-    print(f"[Embedding] status={resp.status_code} body={resp.text[:300]}", flush=True)
-    resp.raise_for_status()
-    return resp.json()["embedding"]["values"]
+    candidates = [
+        ("v1beta", "text-embedding-005"),
+        ("v1beta", "text-embedding-004"),
+        ("v1",     "text-embedding-004"),
+    ]
+    payload = {"content": {"parts": [{"text": text}]}}
+    last_err = None
+    for version, model in candidates:
+        url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:embedContent?key={api_key}"
+        resp = httpx.post(url, json=payload, timeout=30)
+        print(f"[Embedding] {model}/{version}: {resp.status_code}", flush=True)
+        if resp.is_success and "embedding" in resp.json():
+            return resp.json()["embedding"]["values"]
+        last_err = f"{model}/{version} {resp.status_code}: {resp.text[:100]}"
+    raise ValueError(f"所有 Embedding 模型都失敗：{last_err}")
 
 
 def store_chunks(bot_id: str, chunks: List[str], api_key: str = "") -> bool:
