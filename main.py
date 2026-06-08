@@ -914,57 +914,97 @@ async def ai_analysis(
     bot_id: str,
     authorization: Optional[str] = Header(None)
 ):
-    """用 Gemini 分析最近 100 筆對話記錄，回傳 AI 洞察報告"""
+    """用 Gemini 分析最近對話 session，回傳借貸業務洞察報告"""
     get_user_id(authorization)
 
-    # 取 API Key
-    bot_row = supabase.table("bots").select("anthropic_api_key, name").eq("id", bot_id).execute()
+    # 取 bot 設定（含角色描述）
+    bot_row = supabase.table("bots").select("anthropic_api_key, name, system_prompt").eq("id", bot_id).execute()
     if not bot_row.data:
         raise HTTPException(404, "Bot 不存在")
-    api_key = bot_row.data[0].get("anthropic_api_key")
-    bot_name = bot_row.data[0].get("name", "Bot")
+    api_key      = bot_row.data[0].get("anthropic_api_key")
+    bot_name     = bot_row.data[0].get("name", "Bot")
+    system_prompt = bot_row.data[0].get("system_prompt") or ""
     if not api_key:
         raise HTTPException(400, "請先設定 Gemini API Key")
 
-    # 取最近 100 筆對話（問題 + AI 回答）
+    # 取最近 200 筆，帶 session_id 以便分組
     rows = supabase.table("conversations")\
-        .select("question, answer, created_at")\
+        .select("question, answer, session_id, created_at")\
         .eq("bot_id", bot_id)\
-        .order("created_at", desc=True)\
-        .limit(100)\
+        .order("created_at", desc=False)\
+        .limit(200)\
         .execute()
     convs = rows.data or []
     if not convs:
         raise HTTPException(400, "目前沒有對話記錄，無法分析")
 
-    # 整理對話文本
-    lines = []
-    for i, c in enumerate(reversed(convs), 1):
-        q = str(c.get("question", "")).strip()[:300]
-        a = str(c.get("answer", "")).strip()[:300]
-        lines.append(f"[{i}] 客戶：{q}\n    Bot：{a}")
-    conversation_text = "\n\n".join(lines)
+    # ── 依 session_id 分組，組成對話串 ──
+    from collections import OrderedDict
+    sessions: OrderedDict = OrderedDict()
+    for c in convs:
+        sid = c.get("session_id") or "unknown"
+        if sid not in sessions:
+            sessions[sid] = []
+        sessions[sid].append(c)
 
-    prompt = f"""以下是「{bot_name}」這個 AI 客服 Bot 最近的對話記錄（共 {len(convs)} 筆）：
+    # ── 計算完成率（答覆中含 DATA_SAVE 視為完成資料收集）──
+    total_sessions  = len(sessions)
+    completed_sessions = sum(
+        1 for msgs in sessions.values()
+        if any("DATA_SAVE" in str(m.get("answer", "")) for m in msgs)
+    )
+    completion_rate = round(completed_sessions / total_sessions * 100) if total_sessions else 0
+
+    # ── 組成給 AI 的對話文本（最多取 40 個 session）──
+    session_blocks = []
+    for idx, (sid, msgs) in enumerate(list(sessions.items())[-40:], 1):
+        is_done = any("DATA_SAVE" in str(m.get("answer", "")) for m in msgs)
+        status  = "✅ 完成資料收集" if is_done else "❌ 未完成"
+        turns   = []
+        for m in msgs:
+            q = str(m.get("question", "")).strip()[:200]
+            a = str(m.get("answer", "")).strip()[:200]
+            # 移除內部資料標記，避免干擾分析
+            import re as _re
+            a = _re.sub(r'DATA_(?:SAVE|PARTIAL):\s*\{.*?\}', '', a, flags=_re.DOTALL).strip()
+            turns.append(f"  客戶：{q}\n  Bot：{a}")
+        session_blocks.append(
+            f"【對話 {idx}｜{status}】\n" + "\n".join(turns)
+        )
+    conversation_text = "\n\n---\n\n".join(session_blocks)
+
+    # ── 角色設定摘要（給 AI 參考，只取前 300 字）──
+    role_context = f"\n\n【Bot 角色設定（供參考）】\n{system_prompt[:300]}" if system_prompt.strip() else ""
+
+    prompt = f"""你是一位專精借貸業務的客服優化顧問。以下是「{bot_name}」這個貸款諮詢 AI Bot 最近的對話記錄，已按對話 session 分組，共 {total_sessions} 組對話，其中 {completed_sessions} 組完成了資料收集（完成率 {completion_rate}%）。{role_context}
+
+=== 對話記錄 ===
 
 {conversation_text}
 
-請以繁體中文，扮演一位資深客服顧問，分析上面的對話並輸出一份結構化報告。報告必須包含以下四個區塊，每個區塊用 markdown 標題（##）：
+=== 分析任務 ===
 
-## 主要客戶需求
-- 列出 3-5 個客戶最常詢問的主題或需求，每點附一句說明
+請以繁體中文輸出一份結構化分析報告，必須包含以下五個區塊（每個用 ## 標題）：
 
-## Bot 回答品質評估
-- 哪些類型的問題 Bot 回答得好（給正面例子）
-- 哪些問題 Bot 回答不足或需改善（給具體例子）
+## 完成率分析
+- 說明 {completed_sessions}/{total_sessions} 的完成率（{completion_rate}%）是否正常，給出判斷依據
+- 指出哪幾組對話在哪個環節中斷，找出最常見的斷點
+
+## 客戶常見疑問與顧慮
+- 列出 3-5 個客戶最常問的問題或猶豫點
+- 特別注意：對貸款金額、利率、資格條件、還款方式的疑問
+
+## Bot 回答問題
+- 具體列出 Bot 哪些回答有問題（重複詢問已回答的資料、失憶、回答牛頭不對馬嘴等）
+- 引用實際對話片段說明
 
 ## 改善建議
-- 列出 3-5 個具體建議，包括：可以加入哪些 FAQ、知識庫應補充哪些資料、角色設定可如何調整
+- 列出 3-5 個具體可執行的建議
+- 包含：角色設定調整、FAQ 補充、應對客戶猶豫的話術建議
 
-## 客戶情緒與意圖摘要
-- 整體客戶情緒（正面/中性/負面的比例感知）
-- 客戶最常見的意圖（詢問、抱怨、預約、購買...）
-- 一句話總結這個 Bot 目前的表現
+## 整體評估
+- 一段話總結這個 Bot 目前在貸款詢問上的表現
+- 給出 1-10 的綜合評分並說明理由
 
 只輸出報告本身，不要加前言或後記。"""
 
@@ -981,13 +1021,21 @@ async def ai_analysis(
                     model="gemini-2.5-flash",
                     contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
                     config=types.GenerateContentConfig(
-                        max_output_tokens=2048,
+                        max_output_tokens=3000,
                         thinking_config=types.ThinkingConfig(thinking_budget=0),
                     ),
                 )
                 parts = response.candidates[0].content.parts if response.candidates else []
                 report = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
-                return {"report": report.strip(), "analyzed_count": len(convs)}
+                return {
+                    "report": report.strip(),
+                    "stats": {
+                        "total_sessions":     total_sessions,
+                        "completed_sessions": completed_sessions,
+                        "completion_rate":    completion_rate,
+                        "total_messages":     len(convs),
+                    }
+                }
             except Exception as e:
                 last_err = e
                 if "503" in str(e) or "overloaded" in str(e).lower():
