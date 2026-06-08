@@ -909,6 +909,96 @@ async def get_conversations(
     return result.data
 
 
+@app.post("/bots/{bot_id}/ai-analysis")
+async def ai_analysis(
+    bot_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    """用 Gemini 分析最近 100 筆對話記錄，回傳 AI 洞察報告"""
+    get_user_id(authorization)
+
+    # 取 API Key
+    bot_row = supabase.table("bots").select("anthropic_api_key, name").eq("id", bot_id).execute()
+    if not bot_row.data:
+        raise HTTPException(404, "Bot 不存在")
+    api_key = bot_row.data[0].get("anthropic_api_key")
+    bot_name = bot_row.data[0].get("name", "Bot")
+    if not api_key:
+        raise HTTPException(400, "請先設定 Gemini API Key")
+
+    # 取最近 100 筆對話（問題 + AI 回答）
+    rows = supabase.table("conversations")\
+        .select("question, answer, created_at")\
+        .eq("bot_id", bot_id)\
+        .order("created_at", desc=True)\
+        .limit(100)\
+        .execute()
+    convs = rows.data or []
+    if not convs:
+        raise HTTPException(400, "目前沒有對話記錄，無法分析")
+
+    # 整理對話文本
+    lines = []
+    for i, c in enumerate(reversed(convs), 1):
+        q = str(c.get("question", "")).strip()[:300]
+        a = str(c.get("answer", "")).strip()[:300]
+        lines.append(f"[{i}] 客戶：{q}\n    Bot：{a}")
+    conversation_text = "\n\n".join(lines)
+
+    prompt = f"""以下是「{bot_name}」這個 AI 客服 Bot 最近的對話記錄（共 {len(convs)} 筆）：
+
+{conversation_text}
+
+請以繁體中文，扮演一位資深客服顧問，分析上面的對話並輸出一份結構化報告。報告必須包含以下四個區塊，每個區塊用 markdown 標題（##）：
+
+## 主要客戶需求
+- 列出 3-5 個客戶最常詢問的主題或需求，每點附一句說明
+
+## Bot 回答品質評估
+- 哪些類型的問題 Bot 回答得好（給正面例子）
+- 哪些問題 Bot 回答不足或需改善（給具體例子）
+
+## 改善建議
+- 列出 3-5 個具體建議，包括：可以加入哪些 FAQ、知識庫應補充哪些資料、角色設定可如何調整
+
+## 客戶情緒與意圖摘要
+- 整體客戶情緒（正面/中性/負面的比例感知）
+- 客戶最常見的意圖（詢問、抱怨、預約、購買...）
+- 一句話總結這個 Bot 目前的表現
+
+只輸出報告本身，不要加前言或後記。"""
+
+    try:
+        from google import genai
+        from google.genai import types
+        import time as _time
+
+        client = genai.Client(api_key=api_key)
+        last_err = None
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=2048,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                parts = response.candidates[0].content.parts if response.candidates else []
+                report = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
+                return {"report": report.strip(), "analyzed_count": len(convs)}
+            except Exception as e:
+                last_err = e
+                if "503" in str(e) or "overloaded" in str(e).lower():
+                    _time.sleep(3 * (attempt + 1))
+                else:
+                    raise
+        raise last_err
+    except Exception as e:
+        raise HTTPException(500, f"AI 分析失敗：{str(e)[:200]}")
+
+
 # ──────────────────────────────────────
 # Instagram Webhook
 # ──────────────────────────────────────
