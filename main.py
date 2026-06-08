@@ -909,9 +909,49 @@ async def get_conversations(
     return result.data
 
 
+@app.delete("/bots/{bot_id}/conversations/fortune")
+async def delete_fortune_conversations(
+    bot_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    """刪除含占卜/算命關鍵字的對話記錄"""
+    get_user_id(authorization)
+    _fortune_keywords = [
+        "算命", "紫微", "占卜", "命盤", "時辰", "排盤", "星盤",
+        "天機", "運勢", "感情運", "財運", "命格", "宮位", "主星",
+        "斗數", "生辰", "國曆", "農曆出生", "幾點出生",
+    ]
+    # 分批刪除含關鍵字的對話
+    deleted = 0
+    all_rows = supabase.table("conversations")\
+        .select("id, question, answer")\
+        .eq("bot_id", bot_id)\
+        .execute()
+    ids_to_delete = []
+    for row in (all_rows.data or []):
+        text = (row.get("question", "") or "") + (row.get("answer", "") or "")
+        if any(kw in text for kw in _fortune_keywords):
+            ids_to_delete.append(row["id"])
+    if ids_to_delete:
+        # 分批刪除（Supabase 單次 in 查詢上限）
+        batch = 50
+        for i in range(0, len(ids_to_delete), batch):
+            supabase.table("conversations")\
+                .delete()\
+                .in_("id", ids_to_delete[i:i+batch])\
+                .execute()
+        deleted = len(ids_to_delete)
+    return {"deleted": deleted}
+
+
+class AnalysisRequest(BaseModel):
+    days: int = 30  # 分析最近幾天，0 = 不限時間
+
+
 @app.post("/bots/{bot_id}/ai-analysis")
 async def ai_analysis(
     bot_id: str,
+    body: AnalysisRequest = AnalysisRequest(),
     authorization: Optional[str] = Header(None)
 ):
     """用 Gemini 分析最近對話 session，回傳借貸業務洞察報告"""
@@ -927,13 +967,15 @@ async def ai_analysis(
     if not api_key:
         raise HTTPException(400, "請先設定 Gemini API Key")
 
-    # 取最近 200 筆，帶 session_id 以便分組
-    rows = supabase.table("conversations")\
+    # 取對話，依 days 篩選時間範圍
+    query = supabase.table("conversations")\
         .select("question, answer, session_id, created_at")\
         .eq("bot_id", bot_id)\
-        .order("created_at", desc=False)\
-        .limit(200)\
-        .execute()
+        .order("created_at", desc=False)
+    if body.days > 0:
+        since = (datetime.utcnow() - timedelta(days=body.days)).isoformat()
+        query = query.gte("created_at", since)
+    rows = query.limit(200).execute()
     convs = rows.data or []
     if not convs:
         raise HTTPException(400, "目前沒有對話記錄，無法分析")
