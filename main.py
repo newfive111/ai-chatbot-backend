@@ -636,6 +636,17 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
                 await reply_line_message(reply_token, answer, access_token=line_token, quick_replies=quick_replies)
                 logging.info(f"[LINE] Fallback to replyToken for {user_id}")
 
+        # 記錄對話到 DB（供 AI 分析使用）
+        try:
+            supabase.table("conversations").insert({
+                "bot_id": bot_id,
+                "question": combined_msg,
+                "answer": answer,
+                "session_id": session_id,
+            }).execute()
+        except Exception as _e:
+            logging.warning(f"[LINE] conversations insert failed: {_e}")
+
     except Exception as e:
         logging.error(f"[LINE] process_line_buffer error: {e}")
 
@@ -909,39 +920,23 @@ async def get_conversations(
     return result.data
 
 
-@app.delete("/bots/{bot_id}/conversations/fortune")
-async def delete_fortune_conversations(
+@app.delete("/bots/{bot_id}/conversations/all")
+async def delete_all_conversations(
     bot_id: str,
     authorization: Optional[str] = Header(None)
 ):
-    """刪除含占卜/算命關鍵字的對話記錄"""
-    get_user_id(authorization)
-    _fortune_keywords = [
-        "算命", "紫微", "占卜", "命盤", "時辰", "排盤", "星盤",
-        "天機", "運勢", "感情運", "財運", "命格", "宮位", "主星",
-        "斗數", "生辰", "國曆", "農曆出生", "幾點出生",
-    ]
-    # 分批刪除含關鍵字的對話
-    deleted = 0
-    all_rows = supabase.table("conversations")\
-        .select("id, question, answer")\
-        .eq("bot_id", bot_id)\
-        .execute()
-    ids_to_delete = []
-    for row in (all_rows.data or []):
-        text = (row.get("question", "") or "") + (row.get("answer", "") or "")
-        if any(kw in text for kw in _fortune_keywords):
-            ids_to_delete.append(row["id"])
-    if ids_to_delete:
-        # 分批刪除（Supabase 單次 in 查詢上限）
-        batch = 50
-        for i in range(0, len(ids_to_delete), batch):
-            supabase.table("conversations")\
-                .delete()\
-                .in_("id", ids_to_delete[i:i+batch])\
-                .execute()
-        deleted = len(ids_to_delete)
-    return {"deleted": deleted}
+    """刪除此 bot 全部對話記錄"""
+    user_id = get_user_id(authorization)
+    # 驗證 bot 屬於該用戶
+    bot = supabase.table("bots").select("user_id").eq("id", bot_id).execute()
+    if not bot.data or bot.data[0]["user_id"] != user_id:
+        raise HTTPException(403, "無權刪除")
+
+    # 先算總數再刪
+    cnt = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).execute()
+    total = cnt.count or 0
+    supabase.table("conversations").delete().eq("bot_id", bot_id).execute()
+    return {"deleted": total}
 
 
 class AnalysisRequest(BaseModel):
@@ -978,7 +973,13 @@ async def ai_analysis(
     rows = query.limit(200).execute()
     convs = rows.data or []
     if not convs:
-        raise HTTPException(400, "目前沒有對話記錄，無法分析")
+        # 查 DB 全部總數，協助 debug
+        total_all = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).execute().count or 0
+        if total_all == 0:
+            raise HTTPException(400, f"此 Bot 沒有任何對話記錄（資料庫共 0 筆）。如果是 LINE Bot，請確認最近版本已部署、且有實際對話發生。")
+        else:
+            range_label = f"{body.days} 天內" if body.days > 0 else "全部"
+            raise HTTPException(400, f"{range_label}沒有對話記錄。資料庫實際共有 {total_all} 筆，請選擇更長的時間範圍（例如「全部」）。")
 
     # ── 依 session_id 分組，組成對話串 ──
     from collections import OrderedDict
