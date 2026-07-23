@@ -12,6 +12,10 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 # LINE Login（快速登入用，與上面的 Messaging API channel 不同）
 LINE_LOGIN_CHANNEL_ID = os.getenv("LINE_LOGIN_CHANNEL_ID", "")
 LINE_LOGIN_CHANNEL_SECRET = os.getenv("LINE_LOGIN_CHANNEL_SECRET", "")
+
+# 管理用 LINE bot（員工遠端接手/操作客戶 bot 用）
+ADMIN_LINE_CHANNEL_SECRET = os.getenv("ADMIN_LINE_CHANNEL_SECRET", "")
+ADMIN_LINE_CHANNEL_ACCESS_TOKEN = os.getenv("ADMIN_LINE_CHANNEL_ACCESS_TOKEN", "")
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:8000")
 

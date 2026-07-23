@@ -21,6 +21,7 @@ from app.config import (
     SUPABASE_URL, SUPABASE_KEY,
     LINE_LOGIN_CHANNEL_ID, LINE_LOGIN_CHANNEL_SECRET,
     FRONTEND_BASE_URL, BACKEND_BASE_URL,
+    ADMIN_LINE_CHANNEL_SECRET, ADMIN_LINE_CHANNEL_ACCESS_TOKEN,
 )
 from supabase import create_client
 
@@ -1276,6 +1277,357 @@ async def line_webhook(bot_id: str, request: Request):
 
     # 立即回 200 給 LINE Server，避免 timeout
     return {"status": "ok"}
+
+
+# ──────────────────────────────────────
+# 管理用 LINE bot（員工遠端接手 / 操作客戶 bot）
+# ──────────────────────────────────────
+
+import urllib.parse as _urlparse
+
+# 員工在管理 bot 按「代回」後，暫存等待輸入回覆內容的目標
+# key = 管理 bot 的 line userId -> {"bot_id":..., "uid":..., "name":...}
+_admin_pending_reply: Dict[str, dict] = {}
+
+
+async def _admin_push(to: str, messages: list) -> int:
+    """用管理 bot 主動推播（支援 Flex / 多則訊息）。"""
+    if not ADMIN_LINE_CHANNEL_ACCESS_TOKEN:
+        return 0
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={"Authorization": f"Bearer {ADMIN_LINE_CHANNEL_ACCESS_TOKEN}",
+                     "Content-Type": "application/json"},
+            json={"to": to, "messages": messages[:5]},
+        )
+        return resp.status_code
+
+
+async def _admin_reply(reply_token: str, messages: list) -> int:
+    """用管理 bot 回覆（reply token）。"""
+    if not ADMIN_LINE_CHANNEL_ACCESS_TOKEN or not reply_token:
+        return 0
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers={"Authorization": f"Bearer {ADMIN_LINE_CHANNEL_ACCESS_TOKEN}",
+                     "Content-Type": "application/json"},
+            json={"replyToken": reply_token, "messages": messages[:5]},
+        )
+        return resp.status_code
+
+
+def _menu_quick_items() -> list:
+    return [{"type": "action", "action": {"type": "message", "label": "📋 清單", "text": "清單"}}]
+
+
+def _admin_text_msg(text: str, quick_items: Optional[list] = None) -> dict:
+    msg: dict = {"type": "text", "text": text}
+    if quick_items:
+        msg["quickReply"] = {"items": quick_items}
+    return msg
+
+
+def get_staff_by_line(line_user_id: str) -> Optional[dict]:
+    """管理 bot userId → app_user（未綁定回 None）。"""
+    r = supabase.table("staff_line").select("app_user_id").eq("line_user_id", line_user_id).execute()
+    if not r.data:
+        return None
+    au = supabase.table("app_users").select("*").eq("id", r.data[0]["app_user_id"]).execute()
+    return au.data[0] if au.data else None
+
+
+def _staff_bots(app_user: dict) -> list:
+    """員工可操作的所有客戶 bot（團隊內 + 自己建立的舊 bot）。"""
+    org_ids = get_user_org_ids(app_user["id"])
+    seen: dict = {}
+    cols = "id, name, org_id, user_id, line_channel_access_token"
+    if org_ids:
+        r = supabase.table("bots").select(cols).in_("org_id", org_ids).execute()
+        for b in (r.data or []):
+            seen[b["id"]] = b
+    my_uid = app_user.get("supabase_uid")
+    if my_uid:
+        r = supabase.table("bots").select(cols).eq("user_id", my_uid).execute()
+        for b in (r.data or []):
+            seen.setdefault(b["id"], b)
+    return list(seen.values())
+
+
+def _try_bind_staff(line_user_id: str, text: str) -> Optional[dict]:
+    """用綁定碼把員工 LINE 綁到 app_user，成功回 app_user，失敗回 None。"""
+    import re
+    m = re.search(r"\d{6}", text)
+    if not m:
+        return None
+    code = m.group(0)
+    r = supabase.table("line_binding_codes").select("*").eq("code", code).execute()
+    if not r.data:
+        return None
+    rec = r.data[0]
+    try:
+        exp = datetime.fromisoformat(str(rec["expires_at"]).replace("Z", "+00:00"))
+        if exp.tzinfo:
+            exp = exp.replace(tzinfo=None)
+        if datetime.utcnow() > exp:
+            supabase.table("line_binding_codes").delete().eq("code", code).execute()
+            return None
+    except Exception:
+        pass
+    app_user_id = rec["app_user_id"]
+    supabase.table("staff_line").upsert(
+        {"line_user_id": line_user_id, "app_user_id": app_user_id},
+        on_conflict="line_user_id",
+    ).execute()
+    supabase.table("line_binding_codes").delete().eq("code", code).execute()
+    au = supabase.table("app_users").select("*").eq("id", app_user_id).execute()
+    return au.data[0] if au.data else None
+
+
+def _pb(action: str, bot_id: str, uid: str) -> str:
+    return _urlparse.urlencode({"a": action, "b": bot_id, "u": uid})
+
+
+def _conv_bubble(it: dict) -> dict:
+    muted = it["muted"]
+    status = "🙋 真人接手中" if muted else "🤖 AI 自動回覆中"
+    if muted:
+        toggle_btn = {"type": "button", "style": "primary", "color": "#2563eb", "height": "sm",
+                      "action": {"type": "postback", "label": "🤖 恢復 AI",
+                                 "data": _pb("unmute", it["bot_id"], it["uid"]),
+                                 "displayText": f"恢復 AI 回覆 {it['name']}"}}
+    else:
+        toggle_btn = {"type": "button", "style": "primary", "color": "#ea580c", "height": "sm",
+                      "action": {"type": "postback", "label": "🙋 接手",
+                                 "data": _pb("mute", it["bot_id"], it["uid"]),
+                                 "displayText": f"接手 {it['name']}"}}
+    reply_btn = {"type": "button", "style": "secondary", "height": "sm",
+                 "action": {"type": "postback", "label": "💬 代回",
+                            "data": _pb("reply", it["bot_id"], it["uid"]),
+                            "displayText": f"代回 {it['name']}"}}
+    return {
+        "type": "bubble", "size": "kilo",
+        "body": {
+            "type": "box", "layout": "vertical", "spacing": "sm",
+            "contents": [
+                {"type": "text", "text": it["name"], "weight": "bold", "size": "md", "wrap": True},
+                {"type": "text", "text": it["bot_name"], "size": "xs", "color": "#888888"},
+                {"type": "text", "text": (f"「{it['last_q']}」" if it["last_q"] else "（無內容）"),
+                 "size": "sm", "color": "#555555", "wrap": True},
+                {"type": "text", "text": status, "size": "xs",
+                 "color": "#ea580c" if muted else "#16a34a", "margin": "sm"},
+            ],
+        },
+        "footer": {
+            "type": "box", "layout": "vertical", "spacing": "sm",
+            "contents": [toggle_btn, reply_btn],
+        },
+    }
+
+
+async def _build_admin_conversation_list(app_user: dict) -> list:
+    """建立「可接手對話」Flex 清單（回傳 messages）。"""
+    bots = _staff_bots(app_user)
+    if not bots:
+        return [_admin_text_msg("你的團隊目前沒有任何 LINE bot。")]
+
+    since = (datetime.utcnow() - timedelta(days=2)).isoformat()
+    items = []
+    for b in bots:
+        rows = supabase.table("conversations") \
+            .select("session_id, question, created_at") \
+            .eq("bot_id", b["id"]).gte("created_at", since) \
+            .order("created_at", desc=True).limit(60).execute()
+        latest: dict = {}
+        for c in (rows.data or []):
+            uid = _line_user_id_from_session(b["id"], c.get("session_id") or "")
+            if not uid or uid in latest:
+                continue
+            latest[uid] = c  # desc 排序，第一筆即最新
+        for uid, c in latest.items():
+            items.append({
+                "bot_id": b["id"],
+                "bot_name": b.get("name") or "Bot",
+                "uid": uid,
+                "last_q": (c.get("question") or "")[:40],
+                "last_at": c.get("created_at") or "",
+                "muted": _mute_key(b["id"], uid) in _muted_line_users,
+                "token": b.get("line_channel_access_token"),
+            })
+    if not items:
+        return [_admin_text_msg("近 2 天內沒有 LINE 對話。", _menu_quick_items())]
+
+    items.sort(key=lambda x: x["last_at"], reverse=True)
+    items = items[:10]
+    for it in items:
+        it["name"] = await fetch_line_display_name(it["bot_id"], it["uid"], it["token"]) or "LINE 客戶"
+
+    flex = {
+        "type": "flex",
+        "altText": f"可接手對話（{len(items)}）",
+        "contents": {"type": "carousel", "contents": [_conv_bubble(it) for it in items]},
+    }
+    return [flex]
+
+
+async def _admin_send_customer_reply(staff: dict, reply_token: str, pending: dict, text: str):
+    """員工代回：用客戶 bot 把訊息推給客戶，並自動接手（AI 靜音）。"""
+    bot_id, uid = pending["bot_id"], pending["uid"]
+    name = pending.get("name") or "客戶"
+    if bot_id not in {b["id"] for b in _staff_bots(staff)}:
+        await _admin_reply(reply_token, [_admin_text_msg("你沒有這個對話的操作權限。")])
+        return
+    token = _get_bot_config(bot_id).get("line_channel_access_token")
+    status = await push_line_message(uid, text, access_token=token)
+    if status == 200:
+        add_mute(bot_id, uid, muted_by=staff["id"])
+        try:
+            supabase.table("conversations").insert({
+                "bot_id": bot_id,
+                "question": f"（真人 {staff.get('display_name') or ''} 代回）",
+                "answer": text,
+                "session_id": f"line_{bot_id}_{uid}",
+            }).execute()
+        except Exception:
+            pass
+        await _admin_reply(reply_token, [_admin_text_msg(
+            f"✅ 已傳給「{name}」。AI 已暫停，需要時在清單按「恢復 AI」。", _menu_quick_items())])
+    else:
+        await _admin_reply(reply_token, [_admin_text_msg(f"❌ 傳送失敗（{status}），請稍後再試。")])
+
+
+async def _handle_admin_postback(staff: dict, line_uid: str, reply_token: str, params: dict):
+    action, bot_id, uid = params.get("a"), params.get("b"), params.get("u")
+    if not action or not bot_id or not uid:
+        return
+    if bot_id not in {b["id"] for b in _staff_bots(staff)}:
+        await _admin_reply(reply_token, [_admin_text_msg("你沒有這個對話的操作權限。")])
+        return
+    name = await fetch_line_display_name(
+        bot_id, uid, _get_bot_config(bot_id).get("line_channel_access_token")) or "客戶"
+    if action == "mute":
+        add_mute(bot_id, uid, muted_by=staff["id"])
+        await _admin_reply(reply_token, [_admin_text_msg(
+            f"✅ 已接手「{name}」，AI 已暫停。可按「代回」直接回覆，或到 LINE 官方帳號回覆。",
+            _menu_quick_items())])
+    elif action == "unmute":
+        remove_mute(bot_id, uid)
+        await _admin_reply(reply_token, [_admin_text_msg(
+            f"✅ 已恢復「{name}」的 AI 自動回覆。", _menu_quick_items())])
+    elif action == "reply":
+        _admin_pending_reply[line_uid] = {"bot_id": bot_id, "uid": uid, "name": name}
+        await _admin_reply(reply_token, [_admin_text_msg(
+            f"請輸入要傳給「{name}」的訊息（輸入「取消」放棄）：")])
+
+
+async def _handle_admin_event(event: dict):
+    etype = event.get("type")
+    line_uid = event.get("source", {}).get("userId", "")
+    reply_token = event.get("replyToken", "")
+    if not line_uid:
+        return
+
+    staff = get_staff_by_line(line_uid)
+
+    if etype == "follow":
+        if staff:
+            await _admin_reply(reply_token, [_admin_text_msg(
+                f"歡迎回來，{staff.get('display_name') or ''}！輸入「清單」查看可接手的對話。",
+                _menu_quick_items())])
+        else:
+            await _admin_reply(reply_token, [_admin_text_msg(
+                "歡迎使用懶得回管理助手 🤖\n\n請先綁定身分：登入後台 →「團隊成員」頁 → 點「綁定我的 LINE」"
+                "取得 6 碼綁定碼，把數字傳給我即可完成綁定。")])
+        return
+
+    if etype == "postback":
+        if not staff:
+            await _admin_reply(reply_token, [_admin_text_msg("請先綁定身分再操作。")])
+            return
+        params = dict(_urlparse.parse_qsl(event.get("postback", {}).get("data", "")))
+        await _handle_admin_postback(staff, line_uid, reply_token, params)
+        return
+
+    if etype == "message" and event.get("message", {}).get("type") == "text":
+        text = event["message"]["text"].strip()
+
+        if not staff:
+            bound = _try_bind_staff(line_uid, text)
+            if bound:
+                await _admin_reply(reply_token, [_admin_text_msg(
+                    f"✅ 綁定成功，{bound.get('display_name') or ''}！輸入「清單」查看可接手的對話。",
+                    _menu_quick_items())])
+            else:
+                await _admin_reply(reply_token, [_admin_text_msg(
+                    "尚未綁定。請到後台「團隊成員」頁點「綁定我的 LINE」取得 6 碼綁定碼，傳給我完成綁定。")])
+            return
+
+        pending = _admin_pending_reply.pop(line_uid, None)
+        if pending:
+            if text in ["取消", "cancel"]:
+                await _admin_reply(reply_token, [_admin_text_msg("已取消代回。", _menu_quick_items())])
+                return
+            await _admin_send_customer_reply(staff, reply_token, pending, text)
+            return
+
+        if text in ["清單", "選單", "menu", "list", "對話"]:
+            msgs = await _build_admin_conversation_list(staff)
+            await _admin_reply(reply_token, msgs)
+            return
+
+        await _admin_reply(reply_token, [_admin_text_msg(
+            "指令：\n・輸入「清單」查看可接手的對話\n・在對話卡片按「接手／恢復 AI／代回」操作",
+            _menu_quick_items())])
+        return
+
+
+@app.post("/line/admin/webhook")
+async def admin_line_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("X-Line-Signature", "")
+    if not ADMIN_LINE_CHANNEL_SECRET or not ADMIN_LINE_CHANNEL_ACCESS_TOKEN:
+        raise HTTPException(503, "管理 bot 尚未設定")
+    if not verify_line_signature(body, signature, channel_secret=ADMIN_LINE_CHANNEL_SECRET):
+        raise HTTPException(400, "簽名驗證失敗")
+    data = json.loads(body)
+    for event in data.get("events", []):
+        try:
+            await _handle_admin_event(event)
+        except Exception as e:
+            logging.error(f"[ADMIN LINE] event error: {e}")
+    return {"status": "ok"}
+
+
+@app.post("/me/line-bind-code")
+async def create_line_bind_code(authorization: Optional[str] = Header(None)):
+    """產生 6 碼綁定碼，員工傳給管理 bot 完成綁定。"""
+    import random
+    app_user = get_app_user(authorization)
+    supabase.table("line_binding_codes").delete().eq("app_user_id", app_user["id"]).execute()
+    expires = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
+    code = None
+    for _ in range(6):
+        cand = f"{random.randint(0, 999999):06d}"
+        try:
+            supabase.table("line_binding_codes").insert(
+                {"code": cand, "app_user_id": app_user["id"], "expires_at": expires}
+            ).execute()
+            code = cand
+            break
+        except Exception:
+            continue
+    if not code:
+        raise HTTPException(500, "產生綁定碼失敗，請重試")
+    return {"code": code, "expires_in": 900}
+
+
+@app.get("/me/line-bind-status")
+async def line_bind_status(authorization: Optional[str] = Header(None)):
+    """查詢目前登入者是否已綁定管理 bot。"""
+    app_user = get_app_user(authorization)
+    r = supabase.table("staff_line").select("line_user_id").eq("app_user_id", app_user["id"]).execute()
+    return {"bound": bool(r.data)}
 
 
 # ──────────────────────────────────────
