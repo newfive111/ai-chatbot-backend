@@ -105,7 +105,8 @@ def _get_system_prompt(
     context: str,
     custom_system_prompt: Optional[str] = None,
     has_sheet: bool = False,
-    has_calendar: bool = False
+    has_calendar: bool = False,
+    business_hours: Optional[dict] = None,
 ) -> str:
     """
     組合最終 system prompt：[角色設定] + [知識庫] + [預約規則?] + [平台底層規則]
@@ -115,6 +116,28 @@ def _get_system_prompt(
     now_tw = datetime.now(TW)
     weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
     date_info = f"\n\n【目前時間】{now_tw.strftime('%Y-%m-%d')} 星期{weekday_names[now_tw.weekday()]} {now_tw.strftime('%H:%M')}\n"
+
+    # 加入營業時間資訊，避免 AI 亂猜
+    if business_hours:
+        bh_start = business_hours.get("start", "09:00")
+        bh_end = business_hours.get("end", "18:00")
+        bh_weekdays = business_hours.get("weekdays", [1, 2, 3, 4, 5])
+        bh_days_str = "、".join(f"週{weekday_names[d-1]}" for d in bh_weekdays)
+
+        # 用 time 物件正確比較
+        try:
+            _s = datetime.strptime(bh_start, "%H:%M").time()
+            _e = datetime.strptime(bh_end, "%H:%M").time()
+            _cur = now_tw.time()
+            in_hours = (now_tw.isoweekday() in bh_weekdays) and (_s <= _cur <= _e)
+        except Exception:
+            in_hours = None
+
+        status_str = "營業中" if in_hours else ("非營業時間" if in_hours is False else "")
+        date_info += f"【營業時間】{bh_days_str} {bh_start}-{bh_end}"
+        if status_str:
+            date_info += f"（目前：{status_str}）"
+        date_info += "\n"
 
     role_section = custom_system_prompt.strip() if (custom_system_prompt and custom_system_prompt.strip()) \
                    else DEFAULT_ROLE_PROMPT.format(bot_name=bot_name)
@@ -495,12 +518,13 @@ def generate_answer(
     relevant_chunks = search_similar_chunks(bot_id, question, top_k=5, api_key=api_key or "")
     context = "\n\n".join(relevant_chunks)
     has_calendar = bool(calendar_id)
+    _bh = business_hours or {"start": "09:00", "end": "18:00", "weekdays": [1, 2, 3, 4, 5]}
     system_prompt = _get_system_prompt(
         bot_name, context, custom_system_prompt,
         has_sheet=bool(sheet_id),
-        has_calendar=has_calendar
+        has_calendar=has_calendar,
+        business_hours=_bh,
     )
-    _bh = business_hours or {"start": "09:00", "end": "18:00", "weekdays": [1, 2, 3, 4, 5]}
 
     # ── 路徑 A：有自訂 prompt → LLM 全程主導（含 calendar 支援）──
     if custom_system_prompt and custom_system_prompt.strip():
