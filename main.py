@@ -2051,6 +2051,156 @@ async def ai_analysis(
         raise HTTPException(500, f"AI 分析失敗：{str(e)[:200]}")
 
 
+@app.post("/bots/{bot_id}/style-analysis")
+async def style_analysis(
+    bot_id: str,
+    body: AnalysisRequest = AnalysisRequest(),
+    authorization: Optional[str] = Header(None)
+):
+    """語氣風格分析：讀客戶訊息 + 員工真人代回 + Bot 回覆，產出話術風格指南。"""
+    require_bot_access(bot_id, authorization, min_role="viewer")
+
+    bot_row = supabase.table("bots").select("anthropic_api_key, name, system_prompt").eq("id", bot_id).execute()
+    if not bot_row.data:
+        raise HTTPException(404, "Bot 不存在")
+    api_key       = bot_row.data[0].get("anthropic_api_key")
+    bot_name      = bot_row.data[0].get("name", "Bot")
+    system_prompt = bot_row.data[0].get("system_prompt") or ""
+    if not api_key:
+        raise HTTPException(400, "請先設定 Gemini API Key")
+
+    query = supabase.table("conversations")\
+        .select("question, answer, session_id, created_at")\
+        .eq("bot_id", bot_id)\
+        .order("created_at", desc=False)
+    if body.days > 0:
+        since = (datetime.utcnow() - timedelta(days=body.days)).isoformat()
+        query = query.gte("created_at", since)
+    rows = query.limit(200).execute()
+    convs = rows.data or []
+    if not convs:
+        total_all = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).execute().count or 0
+        if total_all == 0:
+            raise HTTPException(400, "此 Bot 沒有任何對話記錄，無法分析語氣風格。")
+        range_label = f"{body.days} 天內" if body.days > 0 else "全部"
+        raise HTTPException(400, f"{range_label}沒有對話記錄。資料庫實際共有 {total_all} 筆，請選更長的時間範圍。")
+
+    # ── 依 session 分組並區分：客戶 / Bot / 員工真人代回 ──
+    from collections import OrderedDict
+    import re as _re
+    sessions: OrderedDict = OrderedDict()
+    human_examples = []          # 員工真人回覆範例（代回）
+    for c in convs:
+        sid = c.get("session_id") or "unknown"
+        sessions.setdefault(sid, []).append(c)
+        q = str(c.get("question", "")).strip()
+        if q.startswith("（真人"):
+            a = str(c.get("answer", "")).strip()
+            if a:
+                human_examples.append(a[:200])
+
+    total_sessions = len(sessions)
+    human_reply_count = len(human_examples)
+
+    # ── 組對話文本（最多 40 個 session）──
+    session_blocks = []
+    for idx, (sid, msgs) in enumerate(list(sessions.items())[-40:], 1):
+        short_id = sid[-8:] if len(sid) > 8 else sid
+        turns = []
+        for m in msgs:
+            q = str(m.get("question", "")).strip()[:200]
+            a = str(m.get("answer", "")).strip()[:200]
+            a = _re.sub(r'DATA_(?:SAVE|PARTIAL):\s*\{.*?\}', '', a, flags=_re.DOTALL).strip()
+            if q.startswith("（真人"):
+                if a:
+                    turns.append(f"  員工真人回覆：{a}")
+            else:
+                if q:
+                    turns.append(f"  客戶：{q}")
+                if a:
+                    turns.append(f"  Bot：{a}")
+        if turns:
+            session_blocks.append(f"【客戶 #{idx}（{short_id}）】\n" + "\n".join(turns))
+    conversation_text = "\n\n---\n\n".join(session_blocks)
+
+    human_block = ""
+    if human_examples:
+        picked = human_examples[-20:]
+        human_block = "\n\n=== 員工真人回覆範例（這是你們客服實際說的話，請優先當作語氣範本）===\n" + \
+            "\n".join(f"・{h}" for h in picked)
+    role_context = f"\n\n【Bot 目前的角色設定（供參考）】\n{system_prompt[:300]}" if system_prompt.strip() else ""
+
+    prompt = f"""你是一位資深客服話術與品牌語氣顧問。以下是「{bot_name}」這個 AI 客服 Bot 最近的對話記錄。請專注分析「語氣、口吻、遣詞用字」，不是分析流程或完成率。{role_context}{human_block}
+
+=== 對話記錄 ===
+
+{conversation_text}
+
+=== 分析任務 ===
+
+請用繁體中文輸出一份「語氣風格指南」，重點在回覆的方式與用字遣詞。格式如下：
+
+## 客戶怎麼說話
+- 歸納客戶的語氣特徵（正式/口語、有沒有情緒、常用詞、常見稱呼與問法），引用 2-3 句真實例子。
+
+## 員工真人回覆的風格
+- {'根據上面「員工真人回覆範例」，歸納你們客服的語氣特色、常用開頭/結尾、用字習慣、貼心之處，引用實際句子。' if human_examples else '（目前沒有員工真人代回的資料，這段請說明「尚無真人範例可學習」，並改用一般優質客服的語氣建議。）'}
+
+## 目前 Bot 回覆的語氣問題
+- 指出 Bot 現在回覆哪裡太生硬、太官方、太冗長、或不夠貼近客戶，引用實際句子佐證。
+
+## 建議的回覆風格指南
+給出可直接照做的準則，越具體越好：
+- **語氣定位**：一句話定調（例如：親切但專業、像鄰家店員）
+- **常用開頭 / 結尾**：列 2-3 個範例句
+- **建議用詞**：哪些詞多用（列出來）
+- **避免用詞**：哪些字眼少用或別用（列出來）
+- **句子長度 / emoji / 標點**：具體建議
+- **改寫示範**：挑 2-3 句現在 Bot 說得不好的話，示範「原本 →建議」的改寫
+
+## 可貼進設定的風格段落
+最後產出一段可直接貼進 Bot system_prompt 的「語氣與話術規範」文字（3-6 句、祈使句、明確可執行），讓 Bot 之後照這個口吻回覆。
+
+只輸出報告本身，不要前言後記。"""
+
+    try:
+        from google import genai
+        from google.genai import types
+        import time as _time
+
+        client = genai.Client(api_key=api_key)
+        last_err = None
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=6000,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                parts = response.candidates[0].content.parts if response.candidates else []
+                report = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
+                return {
+                    "report": report.strip(),
+                    "stats": {
+                        "total_sessions":    total_sessions,
+                        "human_reply_count": human_reply_count,
+                        "total_messages":    len(convs),
+                    }
+                }
+            except Exception as e:
+                last_err = e
+                if "503" in str(e) or "overloaded" in str(e).lower():
+                    _time.sleep(3 * (attempt + 1))
+                else:
+                    raise
+        raise last_err
+    except Exception as e:
+        raise HTTPException(500, f"語氣分析失敗：{str(e)[:200]}")
+
+
 class MuteRequest(BaseModel):
     session_id: str
 
