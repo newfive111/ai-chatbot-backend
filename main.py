@@ -83,6 +83,34 @@ def remove_mute(bot_id: str, line_user_id: str):
     except Exception as e:
         logging.warning(f"[MUTE] remove_mute DB write failed: {e}")
 
+
+# LINE 暱稱快取：key = "{bot_id}:{line_user_id}" -> displayName（記憶體，收訊息時填入）
+_line_profile_cache: Dict[str, str] = {}
+
+
+async def fetch_line_display_name(bot_id: str, user_id: str, line_token: str) -> str:
+    """抓 LINE 暱稱（優先讀快取），失敗回空字串。"""
+    key = _mute_key(bot_id, user_id)
+    if key in _line_profile_cache:
+        return _line_profile_cache[key]
+    if not line_token:
+        return ""
+    try:
+        async with httpx.AsyncClient() as _hc:
+            _r = await _hc.get(
+                f"https://api.line.me/v2/bot/profile/{user_id}",
+                headers={"Authorization": f"Bearer {line_token}"},
+                timeout=5,
+            )
+            if _r.status_code == 200:
+                name = _r.json().get("displayName", "") or ""
+                if name:
+                    _line_profile_cache[key] = name
+                return name
+    except Exception:
+        pass
+    return ""
+
 # 防抖緩衝區：key = "{bot_id}:{line_user_id}"
 # 值 = {"msgs": [], "reply_token": str, "task": asyncio.Task}
 _line_buffers: Dict[str, dict] = {}
@@ -1106,20 +1134,8 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
         keyword_triggers  = bot.get("keyword_triggers") or None
         off_hours_message = bot.get("off_hours_message") or None
 
-        # 抓 LINE 暱稱，存入試算表方便對應聊天室
-        line_display_name = ""
-        if sheet_id and line_token:
-            try:
-                async with httpx.AsyncClient() as _hc:
-                    _r = await _hc.get(
-                        f"https://api.line.me/v2/bot/profile/{user_id}",
-                        headers={"Authorization": f"Bearer {line_token}"},
-                        timeout=5,
-                    )
-                    if _r.status_code == 200:
-                        line_display_name = _r.json().get("displayName", "")
-            except Exception:
-                pass
+        # 抓 LINE 暱稱：填入記憶體快取（對話清單顯示用）＋存入試算表方便對應聊天室
+        line_display_name = await fetch_line_display_name(bot_id, user_id, line_token)
         extra_sheet = {"LINE暱稱": line_display_name} if line_display_name else None
 
         try:
@@ -1710,6 +1726,7 @@ async def list_conversation_sessions(
         is_done = any("DATA_SAVE" in str(m.get("answer", "")) for m in msgs)
         line_uid = _line_user_id_from_session(bot_id, sid)
         muted = bool(line_uid) and _mute_key(bot_id, line_uid) in _muted_line_users
+        display_name = _line_profile_cache.get(_mute_key(bot_id, line_uid), "") if line_uid else ""
         out.append({
             "session_id":   sid,
             "channel":      channel,
@@ -1719,6 +1736,8 @@ async def list_conversation_sessions(
             "completed":    is_done,
             "can_mute":     bool(line_uid),
             "muted":        muted,
+            "line_user_id": line_uid,
+            "display_name": display_name,
             "messages": [
                 {
                     "q": str(m.get("question", ""))[:500],
@@ -1728,6 +1747,18 @@ async def list_conversation_sessions(
                 for m in msgs
             ],
         })
+
+    # 補抓缺少暱稱的 LINE 對話（並行，寫回快取）
+    missing = [s for s in out if s["line_user_id"] and not s["display_name"]]
+    if missing:
+        line_token = _get_bot_config(bot_id).get("line_channel_access_token")
+        if line_token:
+            names = await asyncio.gather(*[
+                fetch_line_display_name(bot_id, s["line_user_id"], line_token) for s in missing
+            ])
+            for s, name in zip(missing, names):
+                s["display_name"] = name
+
     # 最新的在前
     out.sort(key=lambda s: s["last_at"] or "", reverse=True)
     return {"total_sessions": len(out), "total_messages": len(convs), "sessions": out}
