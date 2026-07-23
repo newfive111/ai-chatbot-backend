@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import Optional, Set, Dict
 from datetime import datetime, timedelta
@@ -17,7 +17,11 @@ from app.rag.embeddings import store_chunks, search_similar_chunks
 from app.chat.engine import generate_answer, reset_session
 from app.line.webhook import verify_line_signature, reply_line_message, push_line_message
 from app.auth.utils import create_token, decode_token, generate_bot_id
-from app.config import SUPABASE_URL, SUPABASE_KEY
+from app.config import (
+    SUPABASE_URL, SUPABASE_KEY,
+    LINE_LOGIN_CHANNEL_ID, LINE_LOGIN_CHANNEL_SECRET,
+    FRONTEND_BASE_URL, BACKEND_BASE_URL,
+)
 from supabase import create_client
 
 app = FastAPI(title="AI Chatbot SaaS API")
@@ -104,6 +108,150 @@ async def login(body: LoginRequest):
     except Exception as e:
         raise HTTPException(401, f"帳號或密碼錯誤: {str(e)}")
     raise HTTPException(401, "帳號或密碼錯誤")
+
+
+# ──────────────────────────────────────
+# LINE 快速登入 (LINE Login OAuth 2.1)
+# ──────────────────────────────────────
+
+# state 暫存（CSRF 防護），value = 過期 timestamp，10 分鐘 TTL
+_line_login_states: Dict[str, float] = {}
+
+
+def _find_or_create_supabase_user(email: str, display_name: str):
+    """依 email 找出既有 Supabase auth 使用者；找不到就建立一個（LINE 使用者用隨機密碼）。"""
+    email_l = email.lower()
+    try:
+        users = _admin.auth.admin.list_users()
+        for u in (users or []):
+            if (getattr(u, "email", "") or "").lower() == email_l:
+                return u
+    except Exception as e:
+        logging.warning(f"[LINE login] list_users failed: {e}")
+
+    import secrets
+    res = _admin.auth.admin.create_user({
+        "email": email,
+        "password": secrets.token_urlsafe(24),
+        "email_confirm": True,
+        "user_metadata": {"display_name": display_name, "provider": "line"},
+    })
+    return res.user
+
+
+@app.get("/auth/line/login")
+async def line_login_start():
+    if not LINE_LOGIN_CHANNEL_ID or not LINE_LOGIN_CHANNEL_SECRET:
+        raise HTTPException(503, "LINE 登入尚未設定")
+
+    now = time.time()
+    for s, exp in list(_line_login_states.items()):
+        if exp < now:
+            _line_login_states.pop(s, None)
+
+    state = uuid.uuid4().hex
+    _line_login_states[state] = now + 600
+
+    from urllib.parse import urlencode
+    params = {
+        "response_type": "code",
+        "client_id": LINE_LOGIN_CHANNEL_ID,
+        "redirect_uri": f"{BACKEND_BASE_URL}/auth/line/callback",
+        "state": state,
+        "scope": "profile openid email",
+    }
+    auth_url = "https://access.line.me/oauth2/v2.1/authorize?" + urlencode(params)
+    return {"auth_url": auth_url}
+
+
+@app.get("/auth/line/callback")
+async def line_login_callback(
+    code: str = Query(None),
+    state: str = Query(None),
+    error: str = Query(None),
+):
+    front = FRONTEND_BASE_URL.rstrip("/")
+    if error or not code or not state:
+        return RedirectResponse(f"{front}/login?line_error=1")
+
+    exp = _line_login_states.pop(state, None)
+    if not exp or exp < time.time():
+        return RedirectResponse(f"{front}/login?line_error=state")
+
+    redirect_uri = f"{BACKEND_BASE_URL}/auth/line/callback"
+
+    # 1) 用 code 換 token
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            token_res = await client.post(
+                "https://api.line.me/oauth2/v2.1/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                    "client_id": LINE_LOGIN_CHANNEL_ID,
+                    "client_secret": LINE_LOGIN_CHANNEL_SECRET,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        token_res.raise_for_status()
+        tok = token_res.json()
+    except Exception as e:
+        logging.error(f"[LINE login] token exchange failed: {e}")
+        return RedirectResponse(f"{front}/login?line_error=token")
+
+    id_token = tok.get("id_token")
+    access_token = tok.get("access_token")
+    line_sub = None
+    email = None
+    display_name = "LINE 使用者"
+
+    # 2) 解 id_token（channel secret 簽的 HS256）
+    if id_token:
+        try:
+            import jwt as _jwt
+            claims = _jwt.decode(
+                id_token, LINE_LOGIN_CHANNEL_SECRET,
+                algorithms=["HS256"], audience=LINE_LOGIN_CHANNEL_ID,
+            )
+            line_sub = claims.get("sub")
+            email = claims.get("email")
+            display_name = claims.get("name") or display_name
+        except Exception as e:
+            logging.warning(f"[LINE login] id_token decode failed: {e}")
+
+    # 3) fallback：用 access_token 取 profile
+    if not line_sub and access_token:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                p = await client.get(
+                    "https://api.line.me/v2/profile",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            p.raise_for_status()
+            pj = p.json()
+            line_sub = pj.get("userId")
+            display_name = pj.get("displayName") or display_name
+        except Exception as e:
+            logging.error(f"[LINE login] profile fetch failed: {e}")
+
+    if not line_sub:
+        return RedirectResponse(f"{front}/login?line_error=profile")
+
+    # LINE 未提供 email（未開通 email 權限）→ 用穩定的合成 email
+    if not email:
+        email = f"line_{line_sub}@line.landehui.online"
+
+    # 4) 找出/建立 Supabase 使用者，發自家 token
+    try:
+        user = _find_or_create_supabase_user(email, display_name)
+    except Exception as e:
+        logging.error(f"[LINE login] user provisioning failed: {e}")
+        return RedirectResponse(f"{front}/login?line_error=user")
+
+    created_at_str = user.created_at.isoformat() if getattr(user, "created_at", None) else ""
+    token = create_token(user.id, email=user.email or email, created_at=created_at_str)
+    return RedirectResponse(f"{front}/auth/line/callback?token={token}")
 
 
 # ──────────────────────────────────────
@@ -999,27 +1147,40 @@ async def ai_analysis(
     completion_rate = round(completed_sessions / total_sessions * 100) if total_sessions else 0
 
     # ── 組成給 AI 的對話文本（最多取 40 個 session）──
+    def _channel_of(sid: str) -> str:
+        if sid.startswith("line_"):       return "LINE"
+        if sid.startswith("widget_") or sid.startswith("test_"): return "網頁/測試"
+        if sid.startswith("ig_cmt_"):     return "IG留言"
+        if sid.startswith("ig_"):         return "IG"
+        if sid.startswith("assistant_"):  return "設定助手"
+        return "其他"
+
     session_blocks = []
+    session_labels = []  # 給 AI 在報告中引用用
     for idx, (sid, msgs) in enumerate(list(sessions.items())[-40:], 1):
         is_done = any("DATA_SAVE" in str(m.get("answer", "")) for m in msgs)
         status  = "✅ 完成資料收集" if is_done else "❌ 未完成"
-        turns   = []
+        channel = _channel_of(sid)
+        short_id = sid[-8:] if len(sid) > 8 else sid
+        first_at = str(msgs[0].get("created_at", ""))[:16].replace("T", " ")
+        label = f"客戶 #{idx}（{channel}・{short_id}・{first_at}）"
+        session_labels.append(label)
+        turns = []
         for m in msgs:
             q = str(m.get("question", "")).strip()[:200]
             a = str(m.get("answer", "")).strip()[:200]
-            # 移除內部資料標記，避免干擾分析
             import re as _re
             a = _re.sub(r'DATA_(?:SAVE|PARTIAL):\s*\{.*?\}', '', a, flags=_re.DOTALL).strip()
             turns.append(f"  客戶：{q}\n  Bot：{a}")
         session_blocks.append(
-            f"【對話 {idx}｜{status}】\n" + "\n".join(turns)
+            f"【{label}｜{status}】\n" + "\n".join(turns)
         )
     conversation_text = "\n\n---\n\n".join(session_blocks)
 
     # ── 角色設定摘要（給 AI 參考，只取前 300 字）──
     role_context = f"\n\n【Bot 角色設定（供參考）】\n{system_prompt[:300]}" if system_prompt.strip() else ""
 
-    prompt = f"""你是一位專精借貸業務的客服優化顧問。以下是「{bot_name}」這個貸款諮詢 AI Bot 最近的對話記錄，已按對話 session 分組，共 {total_sessions} 組對話，其中 {completed_sessions} 組完成了資料收集（完成率 {completion_rate}%）。{role_context}
+    prompt = f"""你是一位專精借貸業務的客服優化顧問。以下是「{bot_name}」這個貸款諮詢 AI Bot 最近的對話記錄，已按 session 分組，共 {total_sessions} 組對話、{completed_sessions} 組完成資料收集（完成率 {completion_rate}%）。{role_context}
 
 === 對話記錄 ===
 
@@ -1027,25 +1188,33 @@ async def ai_analysis(
 
 === 分析任務 ===
 
-請以繁體中文輸出一份結構化分析報告，必須包含以下五個區塊（每個用 ## 標題）：
+請以繁體中文輸出一份結構化分析報告，**逐一檢視每組對話**，再做總結。格式如下：
 
-## 完成率分析
-- 說明 {completed_sessions}/{total_sessions} 的完成率（{completion_rate}%）是否正常，給出判斷依據
-- 指出哪幾組對話在哪個環節中斷，找出最常見的斷點
+## 各客戶對話分析
 
-## 客戶常見疑問與顧慮
-- 列出 3-5 個客戶最常問的問題或猶豫點
-- 特別注意：對貸款金額、利率、資格條件、還款方式的疑問
+針對「上面每一組對話」都各做一段小分析（用 ### 當標題，標題格式：`### 客戶 #編號（來源・尾碼）`，要跟上方對話的 label 完全對得起來，方便我去後台對照）。每段請包含：
+- **狀態**：完成 / 未完成（在哪個環節中斷）
+- **客戶疑慮**：這位客戶最在意什麼、有沒有猶豫點
+- **Bot 表現**：這次回答有沒有問題（重複詢問、失憶、答非所問、語氣等），引用一句實際對話佐證
+- **建議**：針對這位客戶，下次應該怎麼處理會更好（一句話）
 
-## Bot 回答問題
-- 具體列出 Bot 哪些回答有問題（重複詢問已回答的資料、失憶、回答牛頭不對馬嘴等）
-- 引用實際對話片段說明
+請務必每一組都寫，不要跳過。如果某組對話太短（例如只有 1-2 句），仍要簡短註記。
 
-## 改善建議
-- 列出 3-5 個具體可執行的建議
-- 包含：角色設定調整、FAQ 補充、應對客戶猶豫的話術建議
+## 整體總結
+
+- **完成率**：{completed_sessions}/{total_sessions}（{completion_rate}%）是否正常、最常見的斷點是什麼
+- **客戶共通疑慮**：歸納上面所有客戶共同關心的 2-3 個點
+- **Bot 反覆出現的問題**：哪些錯誤模式在多個對話中重複出現
+
+## 改善建議（優先順序）
+
+針對整體找出 3-5 個可執行的改善方向，每項標明【優先級：高/中/低】，並具體說明：
+- 要改 Bot 的哪個部分（system_prompt / collect_fields / welcome_message / quick_replies / FAQ 知識庫）
+- 改成什麼樣的具體內容
+- 預期能解決上面哪幾位客戶遇到的問題（引用客戶編號）
 
 ## 整體評估
+
 - 一段話總結這個 Bot 目前在貸款詢問上的表現
 - 給出 1-10 的綜合評分並說明理由
 
@@ -1064,7 +1233,7 @@ async def ai_analysis(
                     model="gemini-2.5-flash",
                     contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
                     config=types.GenerateContentConfig(
-                        max_output_tokens=3000,
+                        max_output_tokens=6000,
                         thinking_config=types.ThinkingConfig(thinking_budget=0),
                     ),
                 )
@@ -1088,6 +1257,68 @@ async def ai_analysis(
         raise last_err
     except Exception as e:
         raise HTTPException(500, f"AI 分析失敗：{str(e)[:200]}")
+
+
+@app.get("/bots/{bot_id}/conversations/sessions")
+async def list_conversation_sessions(
+    bot_id: str,
+    days: int = 0,
+    authorization: Optional[str] = Header(None)
+):
+    """列出 bot 的對話 session（給「查看對話紀錄」用），依 session_id 分組回傳。"""
+    get_user_id(authorization)
+    query = supabase.table("conversations")\
+        .select("question, answer, session_id, created_at")\
+        .eq("bot_id", bot_id)\
+        .order("created_at", desc=False)
+    if days > 0:
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        query = query.gte("created_at", since)
+    rows = query.limit(500).execute()
+    convs = rows.data or []
+
+    from collections import OrderedDict
+    sessions: OrderedDict = OrderedDict()
+    for c in convs:
+        sid = c.get("session_id") or "unknown"
+        if sid not in sessions:
+            sessions[sid] = []
+        sessions[sid].append(c)
+
+    out = []
+    for sid, msgs in sessions.items():
+        if sid.startswith("line_"):
+            channel = "LINE"
+        elif sid.startswith("widget_") or sid.startswith("test_"):
+            channel = "網頁/測試"
+        elif sid.startswith("ig_cmt_"):
+            channel = "IG 留言"
+        elif sid.startswith("ig_"):
+            channel = "IG"
+        elif sid.startswith("assistant_"):
+            channel = "設定助手"
+        else:
+            channel = "其他"
+        is_done = any("DATA_SAVE" in str(m.get("answer", "")) for m in msgs)
+        out.append({
+            "session_id":   sid,
+            "channel":      channel,
+            "message_count": len(msgs),
+            "first_at":     msgs[0].get("created_at"),
+            "last_at":      msgs[-1].get("created_at"),
+            "completed":    is_done,
+            "messages": [
+                {
+                    "q": str(m.get("question", ""))[:500],
+                    "a": str(m.get("answer", ""))[:500],
+                    "at": m.get("created_at"),
+                }
+                for m in msgs
+            ],
+        })
+    # 最新的在前
+    out.sort(key=lambda s: s["last_at"] or "", reverse=True)
+    return {"total_sessions": len(out), "total_messages": len(convs), "sessions": out}
 
 
 # ──────────────────────────────────────
