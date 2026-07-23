@@ -29,6 +29,11 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # 專用 admin client，永遠不呼叫 sign_in，避免 user session 污染 auth.admin.* 呼叫
 _admin = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+@app.on_event("startup")
+async def _startup():
+    load_muted_users()
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -37,8 +42,46 @@ async def health():
 # LINE Bot 狀態管理（in-memory）
 # ──────────────────────────────────────
 
-# 靜音名單：key = "{bot_id}:{line_user_id}"，資料蒐集完成後自動靜音
+# 靜音名單：key = "{bot_id}:{line_user_id}"，記憶體快取（webhook 高頻查詢用）
+# 持久化存於 Supabase chat_mutes 表，重新部署時由 load_muted_users() 重新載入
 _muted_line_users: Set[str] = set()
+
+
+def _mute_key(bot_id: str, line_user_id: str) -> str:
+    return f"{bot_id}:{line_user_id}"
+
+
+def load_muted_users():
+    """啟動時把 DB 的靜音名單載入記憶體快取。"""
+    try:
+        rows = supabase.table("chat_mutes").select("bot_id, line_user_id").execute()
+        for r in rows.data or []:
+            _muted_line_users.add(_mute_key(r["bot_id"], r["line_user_id"]))
+        logging.info(f"[MUTE] Loaded {len(_muted_line_users)} muted chats from DB")
+    except Exception as e:
+        logging.warning(f"[MUTE] load_muted_users failed: {e}")
+
+
+def add_mute(bot_id: str, line_user_id: str, muted_by: Optional[str] = None):
+    """靜音某聊天室（AI 停止回覆），同步寫入記憶體快取 + DB。"""
+    _muted_line_users.add(_mute_key(bot_id, line_user_id))
+    try:
+        supabase.table("chat_mutes").upsert(
+            {"bot_id": bot_id, "line_user_id": line_user_id, "muted_by": muted_by},
+            on_conflict="bot_id,line_user_id",
+        ).execute()
+    except Exception as e:
+        logging.warning(f"[MUTE] add_mute DB write failed: {e}")
+
+
+def remove_mute(bot_id: str, line_user_id: str):
+    """取消靜音（AI 恢復回覆），同步清除記憶體快取 + DB。"""
+    _muted_line_users.discard(_mute_key(bot_id, line_user_id))
+    try:
+        supabase.table("chat_mutes").delete() \
+            .eq("bot_id", bot_id).eq("line_user_id", line_user_id).execute()
+    except Exception as e:
+        logging.warning(f"[MUTE] remove_mute DB write failed: {e}")
 
 # 防抖緩衝區：key = "{bot_id}:{line_user_id}"
 # 值 = {"msgs": [], "reply_token": str, "task": asyncio.Task}
@@ -1103,7 +1146,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
         # DATA_SAVE 已觸發 → engine 標記 handed_off → 同步靜音 in-memory set
         from app.chat.engine import get_session_status
         if get_session_status(session_id) == "handed_off":
-            _muted_line_users.add(f"{bot_id}:{user_id}")
+            add_mute(bot_id, user_id)
             logging.info(f"[LINE] Auto-muted {user_id} (handed_off)")
             # 資料收集完成後不再顯示快速選項
             quick_replies = None
@@ -1178,7 +1221,7 @@ async def line_webhook(bot_id: str, request: Request):
         if user_msg.strip() in ["/reset", "重來", "重置", "重新開始"]:
             session_id = f"line_{bot_id}_{user_id}"
             reset_session(session_id)
-            _muted_line_users.discard(buf_key)
+            remove_mute(bot_id, user_id)
             welcome = bot.get("welcome_message") or f"（記憶已重置）你好！我是{bot.get('name', 'AI 助理')}，有什麼可以幫您的嗎？😊"
             await reply_line_message(reply_token, welcome, access_token=line_token, quick_replies=bot.get("quick_replies") or None)
             continue
@@ -1190,7 +1233,7 @@ async def line_webhook(bot_id: str, request: Request):
 
         # ── 垃圾訊息過濾 ──
         if any(kw in user_msg for kw in _SPAM_KEYWORDS) and len(user_msg) > 30:
-            _muted_line_users.add(buf_key)
+            add_mute(bot_id, user_id)
             logging.info(f"[LINE] Spam-muted {user_id}: {user_msg[:30]}...")
             continue
 
@@ -1582,6 +1625,48 @@ async def ai_analysis(
         raise HTTPException(500, f"AI 分析失敗：{str(e)[:200]}")
 
 
+class MuteRequest(BaseModel):
+    session_id: str
+
+
+def _line_user_id_from_session(bot_id: str, session_id: str) -> str:
+    """從 LINE session_id 取出 line_user_id；非 LINE session 回傳空字串。"""
+    prefix = f"line_{bot_id}_"
+    if session_id.startswith(prefix):
+        return session_id[len(prefix):]
+    return ""
+
+
+@app.post("/bots/{bot_id}/mute")
+async def mute_chat(
+    bot_id: str,
+    body: MuteRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """真人接手：靜音某個 LINE 聊天室，AI 停止自動回覆（員工操作）。"""
+    access = require_bot_access(bot_id, authorization, min_role="editor")
+    line_user_id = _line_user_id_from_session(bot_id, body.session_id)
+    if not line_user_id:
+        raise HTTPException(400, "只能對 LINE 對話切換手動接手")
+    add_mute(bot_id, line_user_id, muted_by=access["app_user"]["id"])
+    return {"ok": True, "muted": True}
+
+
+@app.delete("/bots/{bot_id}/mute")
+async def unmute_chat(
+    bot_id: str,
+    session_id: str = Query(...),
+    authorization: Optional[str] = Header(None)
+):
+    """恢復 AI：取消某個 LINE 聊天室的靜音，AI 重新自動回覆（員工操作）。"""
+    require_bot_access(bot_id, authorization, min_role="editor")
+    line_user_id = _line_user_id_from_session(bot_id, session_id)
+    if not line_user_id:
+        raise HTTPException(400, "只能對 LINE 對話切換手動接手")
+    remove_mute(bot_id, line_user_id)
+    return {"ok": True, "muted": False}
+
+
 @app.get("/bots/{bot_id}/conversations/sessions")
 async def list_conversation_sessions(
     bot_id: str,
@@ -1623,6 +1708,8 @@ async def list_conversation_sessions(
         else:
             channel = "其他"
         is_done = any("DATA_SAVE" in str(m.get("answer", "")) for m in msgs)
+        line_uid = _line_user_id_from_session(bot_id, sid)
+        muted = bool(line_uid) and _mute_key(bot_id, line_uid) in _muted_line_users
         out.append({
             "session_id":   sid,
             "channel":      channel,
@@ -1630,6 +1717,8 @@ async def list_conversation_sessions(
             "first_at":     msgs[0].get("created_at"),
             "last_at":      msgs[-1].get("created_at"),
             "completed":    is_done,
+            "can_mute":     bool(line_uid),
+            "muted":        muted,
             "messages": [
                 {
                     "q": str(m.get("question", ""))[:500],
