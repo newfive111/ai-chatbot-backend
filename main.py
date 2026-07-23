@@ -1167,8 +1167,6 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
             logging.info(f"[LINE] Auto-muted {user_id} (handed_off)")
             # 資料收集完成後不再顯示快速選項
             quick_replies = None
-            # 觸發交接 → 立即通知員工有客戶等待真人
-            asyncio.create_task(_notify_staff_new_message(bot_id, user_id, combined_msg, muted=True))
 
         # 任務完成後靜默（handed_off → engine 回空字串）
         if not answer:
@@ -1193,12 +1191,6 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
             }).execute()
         except Exception as _e:
             logging.warning(f"[LINE] conversations insert failed: {_e}")
-
-        # Phase 3：AI 回覆中也通知員工有新客戶訊息（節流，附一鍵接手卡片）
-        try:
-            await _notify_staff_new_message(bot_id, user_id, combined_msg, muted=False)
-        except Exception as _e:
-            logging.warning(f"[NOTIFY] {_e}")
 
     except Exception as e:
         logging.error(f"[LINE] process_line_buffer error: {e}")
@@ -1253,8 +1245,7 @@ async def line_webhook(bot_id: str, request: Request):
 
         # ── 靜音檢查（已交接，不再 AI 回應）──
         if buf_key in _muted_line_users:
-            logging.info(f"[LINE] Muted user {user_id}, relaying to staff")
-            asyncio.create_task(_notify_staff_new_message(bot_id, user_id, user_msg, muted=True))
+            logging.info(f"[LINE] Muted user {user_id}, ignoring message")
             continue
 
         # ── 垃圾訊息過濾 ──
@@ -1488,77 +1479,6 @@ async def _single_conv_flex(bot_id: str, uid: str) -> dict:
         "muted": _mute_key(bot_id, uid) in _muted_line_users, "name": name,
     }
     return {"type": "flex", "altText": name, "contents": _conv_bubble(it)}
-
-
-# ── Phase 3：新客戶訊息主動推播通知員工（僅通知，接手與否一律由員工決定）──
-_last_notify: Dict[str, float] = {}          # {bot_id}:{uid} -> 上次通知時間戳
-_NOTIFY_COOLDOWN = 600                        # AI 回覆中：同一客戶 10 分鐘內只通知一次
-
-
-def _bot_staff_line_ids(bot_id: str) -> list:
-    """這個 bot 所屬團隊 / 擁有者中，已綁定管理 bot 的員工 LINE userId。"""
-    b = supabase.table("bots").select("org_id, user_id").eq("id", bot_id).execute()
-    if not b.data:
-        return []
-    org_id = b.data[0].get("org_id")
-    owner_uid = b.data[0].get("user_id")
-    app_user_ids: set = set()
-    if org_id:
-        m = supabase.table("memberships").select("user_id").eq("org_id", org_id).execute()
-        for r in (m.data or []):
-            app_user_ids.add(r["user_id"])
-    if owner_uid:
-        au = supabase.table("app_users").select("id").eq("supabase_uid", owner_uid).execute()
-        if au.data:
-            app_user_ids.add(au.data[0]["id"])
-    if not app_user_ids:
-        return []
-    sl = supabase.table("staff_line").select("line_user_id") \
-        .in_("app_user_id", list(app_user_ids)).execute()
-    return [r["line_user_id"] for r in (sl.data or [])]
-
-
-async def _notify_staff_new_message(bot_id: str, uid: str, msg: str, muted: bool):
-    """有新客戶訊息時推播給已綁定的員工管理 bot。
-    - 接手中(muted)：逐則轉達，讓接手的員工看到客戶說了什麼。
-    - AI 回覆中：同一客戶 10 分鐘內只通知一次，附卡片供員工一鍵接手 / 代回。
-    """
-    if not ADMIN_LINE_CHANNEL_ACCESS_TOKEN:
-        return
-    key = _mute_key(bot_id, uid)
-    now = time.time()
-    if not muted:
-        if now - _last_notify.get(key, 0) < _NOTIFY_COOLDOWN:
-            return
-    _last_notify[key] = now
-
-    staff_ids = _bot_staff_line_ids(bot_id)
-    if not staff_ids:
-        return
-
-    bot = _get_bot_config(bot_id)
-    bot_name = bot.get("name") or "Bot"
-    token = bot.get("line_channel_access_token")
-    name = await fetch_line_display_name(bot_id, uid, token) or "LINE 客戶"
-
-    if muted:
-        messages = [_admin_text_msg(f"💬 {name}（{bot_name}）：\n{msg[:200]}")]
-    else:
-        it = {
-            "bot_id": bot_id, "bot_name": bot_name, "uid": uid,
-            "last_q": msg[:60], "time_label": _fmt_time(datetime.utcnow().isoformat()),
-            "muted": False, "name": name,
-        }
-        flex = {"type": "flex", "altText": f"{name} 傳來新訊息", "contents": _conv_bubble(it)}
-        messages = [_admin_text_msg(f"🔔 {name} 傳來新訊息（{bot_name}）"), flex]
-
-    async def _one(sid: str):
-        try:
-            await _admin_push(sid, messages)
-        except Exception as e:
-            logging.warning(f"[NOTIFY] push to {sid} failed: {e}")
-
-    await asyncio.gather(*[_one(s) for s in staff_ids])
 
 
 async def _build_admin_conversation_list(app_user: dict) -> list:
