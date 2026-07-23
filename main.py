@@ -88,6 +88,10 @@ async def register(body: RegisterRequest):
         raise HTTPException(400, f"註冊失敗：{str(e)}")
     if result.user:
         created_at_str = result.user.created_at.isoformat() if result.user.created_at else ""
+        try:
+            ensure_app_user(supabase_uid=result.user.id, email=result.user.email or "")
+        except Exception as e:
+            logging.warning(f"[register] ensure_app_user failed: {e}")
         token = create_token(result.user.id, email=result.user.email or "", created_at=created_at_str)
         return {"token": token, "user_id": result.user.id}
     raise HTTPException(400, "註冊失敗，請稍後再試")
@@ -103,6 +107,10 @@ async def login(body: LoginRequest):
         })
         if result.user:
             created_at_str = result.user.created_at.isoformat() if result.user.created_at else ""
+            try:
+                ensure_app_user(supabase_uid=result.user.id, email=result.user.email or "")
+            except Exception as e:
+                logging.warning(f"[login] ensure_app_user failed: {e}")
             token = create_token(result.user.id, email=result.user.email or "", created_at=created_at_str)
             return {"token": token, "user_id": result.user.id}
     except Exception as e:
@@ -249,9 +257,181 @@ async def line_login_callback(
         logging.error(f"[LINE login] user provisioning failed: {e}")
         return RedirectResponse(f"{front}/login?line_error=user")
 
+    # 建立/連結 app_user（帶上 line_user_id、顯示名稱），並確保有個人團隊
+    try:
+        ensure_app_user(
+            supabase_uid=user.id, email=user.email or email,
+            line_user_id=line_sub, display_name=display_name,
+        )
+    except Exception as e:
+        logging.warning(f"[LINE login] ensure_app_user failed: {e}")
+
     created_at_str = user.created_at.isoformat() if getattr(user, "created_at", None) else ""
     token = create_token(user.id, email=user.email or email, created_at=created_at_str)
     return RedirectResponse(f"{front}/auth/line/callback?token={token}")
+
+
+# ──────────────────────────────────────
+# 團隊 / 成員 / 邀請
+# 權限：看成員 viewer；改角色/移除/邀請 admin；owner 不可被改動
+# ──────────────────────────────────────
+
+_VALID_ASSIGN_ROLES = {"admin", "editor", "viewer"}   # 不能透過 API 直接指派 owner
+_INVITE_TTL_DAYS = 7
+
+
+@app.get("/orgs")
+async def list_my_orgs(authorization: Optional[str] = Header(None)):
+    app_user = get_app_user(authorization)
+    org_ids = get_user_org_ids(app_user["id"])
+    if not org_ids:
+        return []
+    rows = supabase.table("organizations").select("id, name, owner_id").in_("id", org_ids).execute()
+    result = []
+    for o in (rows.data or []):
+        result.append({
+            "id": o["id"],
+            "name": o["name"],
+            "is_owner": o["owner_id"] == app_user["id"],
+            "role": get_membership_role(o["id"], app_user["id"]),
+        })
+    return result
+
+
+@app.get("/orgs/{org_id}/members")
+async def list_members(org_id: str, authorization: Optional[str] = Header(None)):
+    require_org_access(org_id, authorization, min_role="viewer")
+    rows = supabase.table("memberships").select("id, user_id, role, created_at") \
+        .eq("org_id", org_id).order("created_at").execute()
+    members = rows.data or []
+    user_ids = [m["user_id"] for m in members]
+    users_map = {}
+    if user_ids:
+        urows = supabase.table("app_users").select("id, display_name, email, picture_url") \
+            .in_("id", user_ids).execute()
+        users_map = {u["id"]: u for u in (urows.data or [])}
+    for m in members:
+        u = users_map.get(m["user_id"], {})
+        m["display_name"] = u.get("display_name") or u.get("email") or "使用者"
+        m["email"] = u.get("email")
+        m["picture_url"] = u.get("picture_url")
+    return members
+
+
+class UpdateMemberRequest(BaseModel):
+    role: str
+
+
+@app.patch("/orgs/{org_id}/members/{member_user_id}")
+async def update_member(org_id: str, member_user_id: str, body: UpdateMemberRequest,
+                        authorization: Optional[str] = Header(None)):
+    require_org_access(org_id, authorization, min_role="admin")
+    if body.role not in _VALID_ASSIGN_ROLES:
+        raise HTTPException(400, "無效的角色")
+    target = supabase.table("memberships").select("role") \
+        .eq("org_id", org_id).eq("user_id", member_user_id).execute()
+    if not target.data:
+        raise HTTPException(404, "成員不存在")
+    if target.data[0]["role"] == "owner":
+        raise HTTPException(403, "無法變更擁有者的角色")
+    supabase.table("memberships").update({"role": body.role}) \
+        .eq("org_id", org_id).eq("user_id", member_user_id).execute()
+    return {"ok": True}
+
+
+@app.delete("/orgs/{org_id}/members/{member_user_id}")
+async def remove_member(org_id: str, member_user_id: str,
+                        authorization: Optional[str] = Header(None)):
+    require_org_access(org_id, authorization, min_role="admin")
+    target = supabase.table("memberships").select("role") \
+        .eq("org_id", org_id).eq("user_id", member_user_id).execute()
+    if not target.data:
+        raise HTTPException(404, "成員不存在")
+    if target.data[0]["role"] == "owner":
+        raise HTTPException(403, "無法移除團隊擁有者")
+    supabase.table("memberships").delete() \
+        .eq("org_id", org_id).eq("user_id", member_user_id).execute()
+    return {"ok": True}
+
+
+class CreateInviteRequest(BaseModel):
+    role: str = "editor"
+
+
+@app.post("/orgs/{org_id}/invites")
+async def create_invite(org_id: str, body: CreateInviteRequest,
+                        authorization: Optional[str] = Header(None)):
+    ctx = require_org_access(org_id, authorization, min_role="admin")
+    if body.role not in _VALID_ASSIGN_ROLES:
+        raise HTTPException(400, "無效的角色")
+    import secrets as _secrets
+    token = _secrets.token_urlsafe(24)
+    expires_at = (datetime.utcnow() + timedelta(days=_INVITE_TTL_DAYS)).isoformat() + "+00:00"
+    supabase.table("invites").insert({
+        "token": token,
+        "org_id": org_id,
+        "role": body.role,
+        "created_by": ctx["app_user"]["id"],
+        "expires_at": expires_at,
+    }).execute()
+    invite_url = f"{FRONTEND_BASE_URL.rstrip('/')}/invite/{token}"
+    return {"token": token, "invite_url": invite_url, "role": body.role, "expires_at": expires_at}
+
+
+@app.get("/orgs/{org_id}/invites")
+async def list_invites(org_id: str, authorization: Optional[str] = Header(None)):
+    require_org_access(org_id, authorization, min_role="admin")
+    rows = supabase.table("invites").select("token, role, created_at, expires_at, used_at") \
+        .eq("org_id", org_id).is_("used_at", "null").order("created_at", desc=True).execute()
+    return rows.data or []
+
+
+@app.delete("/orgs/{org_id}/invites/{token}")
+async def revoke_invite(org_id: str, token: str, authorization: Optional[str] = Header(None)):
+    require_org_access(org_id, authorization, min_role="admin")
+    supabase.table("invites").delete().eq("token", token).eq("org_id", org_id).execute()
+    return {"ok": True}
+
+
+@app.get("/invites/{token}")
+async def get_invite(token: str):
+    """公開：顯示「XX 邀請你加入」用，不需登入。"""
+    r = supabase.table("invites").select("token, org_id, role, expires_at, used_at").eq("token", token).execute()
+    if not r.data:
+        raise HTTPException(404, "邀請連結無效")
+    inv = r.data[0]
+    if inv.get("used_at"):
+        raise HTTPException(410, "此邀請連結已被使用")
+    if inv.get("expires_at") and inv["expires_at"] < datetime.utcnow().isoformat():
+        raise HTTPException(410, "此邀請連結已過期")
+    org = supabase.table("organizations").select("name").eq("id", inv["org_id"]).execute()
+    org_name = org.data[0]["name"] if org.data else "團隊"
+    return {"org_name": org_name, "role": inv["role"]}
+
+
+@app.post("/invites/{token}/accept")
+async def accept_invite(token: str, authorization: Optional[str] = Header(None)):
+    """登入後呼叫：把自己加入該團隊。"""
+    app_user = get_app_user(authorization)
+    r = supabase.table("invites").select("*").eq("token", token).execute()
+    if not r.data:
+        raise HTTPException(404, "邀請連結無效")
+    inv = r.data[0]
+    if inv.get("used_at"):
+        raise HTTPException(410, "此邀請連結已被使用")
+    if inv.get("expires_at") and inv["expires_at"] < datetime.utcnow().isoformat():
+        raise HTTPException(410, "此邀請連結已過期")
+    org_id = inv["org_id"]
+    existing = get_membership_role(org_id, app_user["id"])
+    if existing is None:
+        supabase.table("memberships").insert({
+            "org_id": org_id,
+            "user_id": app_user["id"],
+            "role": inv["role"],
+        }).execute()
+    supabase.table("invites").update({"used_at": datetime.utcnow().isoformat() + "+00:00"}) \
+        .eq("token", token).execute()
+    return {"ok": True, "org_id": org_id}
 
 
 # ──────────────────────────────────────
@@ -316,6 +496,154 @@ def check_message_allowed(bot_id: str) -> tuple[bool, str]:
     return False, "此服務目前已暫停，如需繼續使用請聯絡我們。"
 
 
+# ──────────────────────────────────────
+# 多租戶授權（團隊 / 成員 / 角色）
+# ──────────────────────────────────────
+
+_ROLE_RANK = {"viewer": 1, "editor": 2, "admin": 3, "owner": 4}
+
+
+def ensure_app_user(supabase_uid: str = None, email: str = "",
+                    line_user_id: str = None, display_name: str = "",
+                    picture_url: str = "") -> dict:
+    """確保 app_users 有這位使用者，沒有就建立，並自動建立個人團隊 + owner membership（冪等）。"""
+    row = None
+    if line_user_id:
+        r = supabase.table("app_users").select("*").eq("line_user_id", line_user_id).execute()
+        row = r.data[0] if r.data else None
+    if row is None and supabase_uid:
+        r = supabase.table("app_users").select("*").eq("supabase_uid", supabase_uid).execute()
+        row = r.data[0] if r.data else None
+    if row is None and email:
+        r = supabase.table("app_users").select("*").eq("email", email).execute()
+        row = r.data[0] if r.data else None
+
+    if row is None:
+        insert_data = {
+            "email": email or None,
+            "supabase_uid": supabase_uid or None,
+            "line_user_id": line_user_id or None,
+            "display_name": display_name or (email.split("@")[0] if email else "使用者"),
+            "picture_url": picture_url or None,
+        }
+        row = supabase.table("app_users").insert(insert_data).execute().data[0]
+    else:
+        patch = {}
+        if line_user_id and not row.get("line_user_id"):
+            patch["line_user_id"] = line_user_id
+        if supabase_uid and not row.get("supabase_uid"):
+            patch["supabase_uid"] = supabase_uid
+        if email and not row.get("email"):
+            patch["email"] = email
+        if patch:
+            supabase.table("app_users").update(patch).eq("id", row["id"]).execute()
+            row.update(patch)
+
+    # 確保有個人團隊 + owner membership
+    org = supabase.table("organizations").select("id").eq("owner_id", row["id"]).limit(1).execute()
+    if not org.data:
+        org_name = row.get("display_name") or "我的團隊"
+        new_org = supabase.table("organizations").insert(
+            {"name": org_name, "owner_id": row["id"]}
+        ).execute().data[0]
+        supabase.table("memberships").insert(
+            {"org_id": new_org["id"], "user_id": row["id"], "role": "owner"}
+        ).execute()
+
+    return row
+
+
+def get_app_user(authorization: str = None) -> dict:
+    """從 JWT 解析出 app_user row（root token 帶 user_id=supabase uid，自動補建）。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "未授權")
+    payload = decode_token(authorization.replace("Bearer ", ""))
+    app_user_id = payload.get("app_user_id")
+    if app_user_id:
+        r = supabase.table("app_users").select("*").eq("id", app_user_id).execute()
+        if r.data:
+            return r.data[0]
+    legacy_uid = payload.get("user_id")
+    if legacy_uid:
+        return ensure_app_user(supabase_uid=legacy_uid, email=payload.get("email", ""))
+    raise HTTPException(401, "使用者不存在")
+
+
+def get_org(org_id: str) -> Optional[dict]:
+    r = supabase.table("organizations").select("*").eq("id", org_id).execute()
+    return r.data[0] if r.data else None
+
+
+def get_user_org_ids(app_user_id: str) -> list:
+    r = supabase.table("memberships").select("org_id").eq("user_id", app_user_id).execute()
+    return [m["org_id"] for m in (r.data or [])]
+
+
+def get_membership_role(org_id: str, app_user_id: str) -> Optional[str]:
+    r = supabase.table("memberships").select("role") \
+        .eq("org_id", org_id).eq("user_id", app_user_id).execute()
+    return r.data[0]["role"] if r.data else None
+
+
+def get_primary_org_id(app_user: dict) -> str:
+    """使用者的主要團隊：優先自己擁有的個人團隊，否則第一個所屬團隊。"""
+    owned = supabase.table("organizations").select("id") \
+        .eq("owner_id", app_user["id"]).limit(1).execute()
+    if owned.data:
+        return owned.data[0]["id"]
+    org_ids = get_user_org_ids(app_user["id"])
+    if org_ids:
+        return org_ids[0]
+    ensure_app_user(supabase_uid=app_user.get("supabase_uid"), email=app_user.get("email") or "")
+    owned = supabase.table("organizations").select("id") \
+        .eq("owner_id", app_user["id"]).limit(1).execute()
+    return owned.data[0]["id"]
+
+
+def _org_owner_uid(org: dict) -> Optional[str]:
+    if not org or not org.get("owner_id"):
+        return None
+    owner = supabase.table("app_users").select("supabase_uid").eq("id", org["owner_id"]).execute()
+    return owner.data[0].get("supabase_uid") if owner.data else None
+
+
+def get_org_slots(org_id: str) -> int:
+    """該團隊可用的付費 bot 名額（依團隊 owner 的訂閱計算）。"""
+    org = get_org(org_id)
+    uid = _org_owner_uid(org)
+    return get_bot_slots(uid) if uid else 0
+
+
+def require_org_access(org_id: str, authorization: str = None, min_role: str = "viewer") -> dict:
+    """驗證使用者對該 org 有足夠權限，回傳 {app_user, role}。非成員丟 403。"""
+    app_user = get_app_user(authorization)
+    role = get_membership_role(org_id, app_user["id"])
+    if role is None:
+        raise HTTPException(403, "無權存取此團隊")
+    if _ROLE_RANK.get(role, 0) < _ROLE_RANK.get(min_role, 99):
+        raise HTTPException(403, "權限不足")
+    return {"app_user": app_user, "role": role}
+
+
+def require_bot_access(bot_id: str, authorization: str = None, min_role: str = "viewer") -> dict:
+    """驗證使用者對該 bot 有足夠權限，回傳 {app_user, bot, role, org_id}。"""
+    app_user = get_app_user(authorization)
+    bot = supabase.table("bots").select("id, user_id, org_id").eq("id", bot_id).execute()
+    if not bot.data:
+        raise HTTPException(404, "Bot 不存在")
+    bot_row = bot.data[0]
+    org_id = bot_row.get("org_id")
+    role = get_membership_role(org_id, app_user["id"]) if org_id else None
+    # 相容尚未遷移 org_id 的舊 bot：建立者本人視為 owner
+    if role is None and bot_row.get("user_id") and bot_row["user_id"] == app_user.get("supabase_uid"):
+        role = "owner"
+    if role is None:
+        raise HTTPException(403, "無權存取此 Bot")
+    if _ROLE_RANK.get(role, 0) < _ROLE_RANK.get(min_role, 99):
+        raise HTTPException(403, "權限不足")
+    return {"app_user": app_user, "bot": bot_row, "role": role, "org_id": org_id}
+
+
 class CreateBotRequest(BaseModel):
     system_prompt: Optional[str] = None
     collect_fields: Optional[list] = None
@@ -327,19 +655,21 @@ async def create_bot(
     body: CreateBotRequest = CreateBotRequest(),
     authorization: Optional[str] = Header(None)
 ):
-    user_id = get_user_id(authorization)
+    app_user = get_app_user(authorization)
+    org_id = get_primary_org_id(app_user)
+    user_id = app_user.get("supabase_uid") or get_user_id(authorization)
 
-    # 限制：免費 1 個，每個付費訂閱 +1
-    existing = supabase.table("bots").select("id", count="exact").eq("user_id", user_id).execute()
+    # 限制：免費 1 個，每個付費訂閱 +1（依團隊計算）
+    existing = supabase.table("bots").select("id", count="exact").eq("org_id", org_id).execute()
     current_count = existing.count or 0
-    slots = get_bot_slots(user_id)
+    slots = get_org_slots(org_id)
     max_bots = 1 + slots  # 1 免費 + N 付費
 
     if current_count >= max_bots:
         raise HTTPException(403, f"已達上限（{max_bots} 個 Bot）。請至定價頁購買更多名額。")
 
     bot_id = generate_bot_id()
-    insert_data: dict = {"id": bot_id, "user_id": user_id, "name": name}
+    insert_data: dict = {"id": bot_id, "user_id": user_id, "org_id": org_id, "name": name}
     if body.system_prompt is not None:
         insert_data["system_prompt"] = body.system_prompt
     if body.collect_fields is not None:
@@ -351,19 +681,29 @@ async def create_bot(
 
 @app.get("/bots")
 async def list_bots(authorization: Optional[str] = Header(None)):
-    user_id   = get_user_id(authorization)
-    slots     = get_bot_slots(user_id)
-    result    = supabase.table("bots").select("*").eq("user_id", user_id).order("created_at").execute()
-    bots      = result.data or []
-    # 最早建立的 bot 依序分配付費名額
-    for i, bot in enumerate(bots):
-        bot["plan"] = "paid" if i < slots else "free"
+    app_user = get_app_user(authorization)
+    org_ids = get_user_org_ids(app_user["id"])
+    seen: dict = {}
+    if org_ids:
+        result = supabase.table("bots").select("*").in_("org_id", org_ids).order("created_at").execute()
+        for b in (result.data or []):
+            seen[b["id"]] = b
+    # 相容尚未遷移 org_id 的舊 bot（建立者本人）
+    my_uid = app_user.get("supabase_uid")
+    if my_uid:
+        legacy = supabase.table("bots").select("*").eq("user_id", my_uid).order("created_at").execute()
+        for b in (legacy.data or []):
+            seen.setdefault(b["id"], b)
+    bots = sorted(seen.values(), key=lambda b: b.get("created_at") or "")
+    # 依「該 bot 的擁有者名額」標記付費/免費
+    for bot in bots:
+        bot["plan"] = "paid" if is_bot_paid(bot["id"]) else "free"
     return bots
 
 @app.get("/bots/{bot_id}")
 async def get_bot(bot_id: str, authorization: Optional[str] = Header(None)):
     """取得單一 Bot 完整設定（API Key 只回傳是否已設定）"""
-    get_user_id(authorization)
+    access = require_bot_access(bot_id, authorization, min_role="viewer")
     result = supabase.table("bots").select("*").eq("id", bot_id).execute()
     if not result.data:
         raise HTTPException(404, "Bot 不存在")
@@ -371,6 +711,7 @@ async def get_bot(bot_id: str, authorization: Optional[str] = Header(None)):
     # 不回傳明文 API Key，只告訴前端有沒有設定
     bot["has_api_key"] = bool(bot.get("anthropic_api_key"))
     bot.pop("anthropic_api_key", None)
+    bot["my_role"] = access["role"]
     return bot
 
 @app.get("/bots/{bot_id}/welcome")
@@ -415,7 +756,7 @@ async def update_bot(
     body: UpdateBotRequest,
     authorization: Optional[str] = Header(None)
 ):
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="editor")
     update_data = {}
     # exclude_unset=True：只處理請求中明確傳入的欄位，避免未傳的欄位被誤清空
     for k, v in body.model_dump(exclude_unset=True).items():
@@ -472,11 +813,7 @@ async def update_bot(
 @app.delete("/bots/{bot_id}")
 async def delete_bot(bot_id: str, authorization: Optional[str] = Header(None)):
     """刪除 bot（包含相關的 knowledge、sessions、conversations）"""
-    user_id = get_user_id(authorization)
-    # 驗證 bot 屬於該 user
-    bot = supabase.table("bots").select("user_id").eq("id", bot_id).execute()
-    if not bot.data or bot.data[0]["user_id"] != user_id:
-        raise HTTPException(403, "無權刪除此 Bot")
+    require_bot_access(bot_id, authorization, min_role="admin")
 
     # 刪除關聯資料
     try:
@@ -502,7 +839,7 @@ async def upload_document(
     file: UploadFile = File(...),
     authorization: Optional[str] = Header(None)
 ):
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="editor")
     bot_row = supabase.table("bots").select("anthropic_api_key").eq("id", bot_id).execute()
     if not bot_row.data:
         raise HTTPException(404, "Bot 不存在")
@@ -534,7 +871,7 @@ async def add_faq(
     body: FAQRequest,
     authorization: Optional[str] = Header(None)
 ):
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="editor")
     bot_row = supabase.table("bots").select("anthropic_api_key").eq("id", bot_id).execute()
     if not bot_row.data:
         raise HTTPException(404, "Bot 不存在")
@@ -554,7 +891,7 @@ async def list_knowledge(
     bot_id: str,
     authorization: Optional[str] = Header(None)
 ):
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="viewer")
     result = supabase.table("knowledge_chunks")\
         .select("id, content, created_at")\
         .eq("bot_id", bot_id)\
@@ -567,7 +904,7 @@ async def clear_knowledge(
     bot_id: str,
     authorization: Optional[str] = Header(None)
 ):
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="editor")
     supabase.table("knowledge_chunks").delete().eq("bot_id", bot_id).execute()
     return {"message": "知識庫已清除"}
 
@@ -577,7 +914,7 @@ async def delete_chunk(
     chunk_id: str,
     authorization: Optional[str] = Header(None)
 ):
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="editor")
     supabase.table("knowledge_chunks").delete().eq("id", chunk_id).eq("bot_id", bot_id).execute()
     return {"message": "已刪除"}
 
@@ -591,7 +928,7 @@ async def update_chunk(
     body: UpdateChunkRequest,
     authorization: Optional[str] = Header(None)
 ):
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="editor")
     supabase.table("knowledge_chunks")\
         .update({"content": body.content})\
         .eq("id", chunk_id)\
@@ -897,13 +1234,12 @@ async def assistant_chat(
     authorization: Optional[str] = Header(None)
 ):
     """AI 設定助手：用 Gemini Function Calling 幫用戶直接操作 Bot 設定"""
-    user_id = get_user_id(authorization)
-    # 驗證 bot 屬於該用戶，並取 API Key
-    r = supabase.table("bots").select("anthropic_api_key").eq("id", body.bot_id).eq("user_id", user_id).execute()
+    access = require_bot_access(body.bot_id, authorization, min_role="editor")
+    r = supabase.table("bots").select("anthropic_api_key").eq("id", body.bot_id).execute()
     if not r.data:
         raise HTTPException(404, "Bot 不存在")
     api_key = r.data[0].get("anthropic_api_key")
-    session_id = body.session_id or f"assistant_{user_id}_{body.bot_id}"
+    session_id = body.session_id or f"assistant_{access['app_user']['id']}_{body.bot_id}"
 
     from app.assistant.engine import run_assistant
     reply = run_assistant(body.bot_id, body.message, session_id, api_key)
@@ -920,10 +1256,7 @@ async def get_settings_history(
     authorization: Optional[str] = Header(None)
 ):
     """取得 Bot 設定歷史快照（最近 30 筆）"""
-    user_id = get_user_id(authorization)
-    bot = supabase.table("bots").select("id").eq("id", bot_id).eq("user_id", user_id).execute()
-    if not bot.data:
-        raise HTTPException(404, "Bot 不存在")
+    require_bot_access(bot_id, authorization, min_role="viewer")
     rows = supabase.table("bot_settings_history") \
         .select("id, source, system_prompt, collect_fields, welcome_message, quick_replies, created_at") \
         .eq("bot_id", bot_id) \
@@ -940,10 +1273,7 @@ async def restore_settings_snapshot(
     authorization: Optional[str] = Header(None)
 ):
     """還原 Bot 設定到指定快照"""
-    user_id = get_user_id(authorization)
-    bot = supabase.table("bots").select("id").eq("id", bot_id).eq("user_id", user_id).execute()
-    if not bot.data:
-        raise HTTPException(404, "Bot 不存在")
+    require_bot_access(bot_id, authorization, min_role="editor")
 
     snap = supabase.table("bot_settings_history") \
         .select("*").eq("id", snapshot_id).eq("bot_id", bot_id).execute()
@@ -974,10 +1304,7 @@ async def get_bot_analytics(
     authorization: Optional[str] = Header(None)
 ):
     """Bot 數據分析：總對話數、今日、本週、7天趨勢、熱門問題、峰值時段、週成長率"""
-    user_id = get_user_id(authorization)
-    bot = supabase.table("bots").select("id").eq("id", bot_id).eq("user_id", user_id).execute()
-    if not bot.data:
-        raise HTTPException(404, "Bot 不存在")
+    require_bot_access(bot_id, authorization, min_role="viewer")
 
     now = datetime.utcnow()
     # 時區偏移（台灣 UTC+8）
@@ -1058,7 +1385,7 @@ async def get_conversations(
     bot_id: str,
     authorization: Optional[str] = Header(None)
 ):
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="viewer")
     result = supabase.table("conversations")\
         .select("*")\
         .eq("bot_id", bot_id)\
@@ -1074,11 +1401,7 @@ async def delete_all_conversations(
     authorization: Optional[str] = Header(None)
 ):
     """刪除此 bot 全部對話記錄"""
-    user_id = get_user_id(authorization)
-    # 驗證 bot 屬於該用戶
-    bot = supabase.table("bots").select("user_id").eq("id", bot_id).execute()
-    if not bot.data or bot.data[0]["user_id"] != user_id:
-        raise HTTPException(403, "無權刪除")
+    require_bot_access(bot_id, authorization, min_role="editor")
 
     # 先算總數再刪
     cnt = supabase.table("conversations").select("id", count="exact").eq("bot_id", bot_id).execute()
@@ -1098,7 +1421,7 @@ async def ai_analysis(
     authorization: Optional[str] = Header(None)
 ):
     """用 Gemini 分析最近對話 session，回傳借貸業務洞察報告"""
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="viewer")
 
     # 取 bot 設定（含角色描述）
     bot_row = supabase.table("bots").select("anthropic_api_key, name, system_prompt").eq("id", bot_id).execute()
@@ -1266,7 +1589,7 @@ async def list_conversation_sessions(
     authorization: Optional[str] = Header(None)
 ):
     """列出 bot 的對話 session（給「查看對話紀錄」用），依 session_id 分組回傳。"""
-    get_user_id(authorization)
+    require_bot_access(bot_id, authorization, min_role="viewer")
     query = supabase.table("conversations")\
         .select("question, answer, session_id, created_at")\
         .eq("bot_id", bot_id)\
