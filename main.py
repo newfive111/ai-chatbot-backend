@@ -790,6 +790,58 @@ class GeneratePersonaRequest(BaseModel):
     description: str
 
 
+_PERSONA_JSON_SPEC = """請只輸出一個 JSON 物件，不要有其他文字，格式如下：
+{
+  "business": "用一到兩句描述這個生意在做什麼（繁體中文）",
+  "role": "從這五個擇一：customer_service（客服）/ sales（業務銷售）/ booking（預約）/ consultant（諮詢顧問）/ general（一般助理）",
+  "tones": ["從這些語氣挑 1-3 個：親切、專業、簡潔、熱情活潑、正式禮貌、幽默輕鬆"],
+  "highlights": "客服最該讓客戶知道的重點（營業項目、特色、常見問答方向），2-4 行，繁體中文；不確定就留空字串",
+  "taboos": "這個角色絕對不該做或說的事，1-2 行，繁體中文；不確定就留空字串"
+}"""
+
+
+def _ai_persona_form(api_key: str, instruction: str) -> dict:
+    """呼叫 Gemini 產出結構化角色填空 dict，並正規化 role / tones。"""
+    from google import genai
+    from google.genai import types
+    import time as _time
+
+    client = genai.Client(api_key=api_key)
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[types.Content(role="user", parts=[types.Part(text=instruction)])],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=1200,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    response_mime_type="application/json",
+                ),
+            )
+            parts = response.candidates[0].content.parts if response.candidates else []
+            raw = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
+            data = json.loads(raw)
+            valid_roles = {"customer_service", "sales", "booking", "consultant", "general"}
+            valid_tones = {"親切", "專業", "簡潔", "熱情活潑", "正式禮貌", "幽默輕鬆"}
+            role = data.get("role") if data.get("role") in valid_roles else "customer_service"
+            tones = [t for t in (data.get("tones") or []) if t in valid_tones][:3] or ["親切"]
+            return {
+                "business":   str(data.get("business") or "").strip(),
+                "role":       role,
+                "tones":      tones,
+                "highlights": str(data.get("highlights") or "").strip(),
+                "taboos":     str(data.get("taboos") or "").strip(),
+            }
+        except Exception as e:
+            last_err = e
+            if "503" in str(e) or "overloaded" in str(e).lower():
+                _time.sleep(3 * (attempt + 1))
+            else:
+                raise
+    raise last_err
+
+
 @app.post("/bots/{bot_id}/generate-persona")
 async def generate_persona(
     bot_id: str,
@@ -810,61 +862,42 @@ async def generate_persona(
     if not api_key:
         raise HTTPException(400, "請先設定 Gemini API Key")
 
-    prompt = f"""用戶用一句話描述他的生意，請幫他規劃這個 AI 客服 Bot（名稱：「{bot_name}」）的角色設定。
+    instruction = f"""用戶用一句話描述他的生意，請幫他規劃這個 AI 客服 Bot（名稱：「{bot_name}」）的角色設定。
 
 用戶描述：{desc}
 
-請只輸出一個 JSON 物件，不要有其他文字，格式如下：
-{{
-  "business": "用一到兩句描述這個生意在做什麼（繁體中文）",
-  "role": "從這五個擇一：customer_service（客服）/ sales（業務銷售）/ booking（預約）/ consultant（諮詢顧問）/ general（一般助理）",
-  "tones": ["從這些語氣挑 1-3 個：親切、專業、簡潔、熱情活潑、正式禮貌、幽默輕鬆"],
-  "highlights": "這個生意的客服最該讓客戶知道的重點（例如營業項目、特色、常見問答方向），2-4 行，繁體中文；不確定就留空字串",
-  "taboos": "這個角色絕對不該做或說的事，1-2 行，繁體中文；不確定就留空字串"
-}}"""
-
+{_PERSONA_JSON_SPEC}"""
     try:
-        from google import genai
-        from google.genai import types
-        import time as _time
-
-        client = genai.Client(api_key=api_key)
-        last_err = None
-        for attempt in range(3):
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-                    config=types.GenerateContentConfig(
-                        max_output_tokens=1200,
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                        response_mime_type="application/json",
-                    ),
-                )
-                parts = response.candidates[0].content.parts if response.candidates else []
-                raw = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
-                data = json.loads(raw)
-                # 正規化
-                valid_roles = {"customer_service", "sales", "booking", "consultant", "general"}
-                valid_tones = {"親切", "專業", "簡潔", "熱情活潑", "正式禮貌", "幽默輕鬆"}
-                role = data.get("role") if data.get("role") in valid_roles else "customer_service"
-                tones = [t for t in (data.get("tones") or []) if t in valid_tones][:3] or ["親切"]
-                return {
-                    "business":   str(data.get("business") or "").strip(),
-                    "role":       role,
-                    "tones":      tones,
-                    "highlights": str(data.get("highlights") or "").strip(),
-                    "taboos":     str(data.get("taboos") or "").strip(),
-                }
-            except Exception as e:
-                last_err = e
-                if "503" in str(e) or "overloaded" in str(e).lower():
-                    _time.sleep(3 * (attempt + 1))
-                else:
-                    raise
-        raise last_err
+        return _ai_persona_form(api_key, instruction)
     except Exception as e:
         raise HTTPException(500, f"AI 生成失敗：{str(e)[:200]}")
+
+
+@app.post("/bots/{bot_id}/extract-persona")
+async def extract_persona(bot_id: str, authorization: Optional[str] = Header(None)):
+    """把 bot 現有的 system_prompt 反向拆解成結構化角色填空（給老 bot 切換簡單模式）。"""
+    require_bot_access(bot_id, authorization, min_role="editor")
+    bot_row = supabase.table("bots").select("anthropic_api_key, name, system_prompt").eq("id", bot_id).execute()
+    if not bot_row.data:
+        raise HTTPException(404, "Bot 不存在")
+    api_key  = bot_row.data[0].get("anthropic_api_key")
+    bot_name = bot_row.data[0].get("name", "Bot")
+    sp = (bot_row.data[0].get("system_prompt") or "").strip()
+    if not api_key:
+        raise HTTPException(400, "請先設定 Gemini API Key")
+    if not sp:
+        raise HTTPException(400, "這個 Bot 還沒有角色設定可以拆解")
+
+    instruction = f"""以下是一個 AI 客服 Bot（名稱：「{bot_name}」）目前的角色設定文字。請把它拆解、歸納成結構化欄位，盡量保留原意，不要自行新增原文沒有的內容。
+
+=== 目前的角色設定 ===
+{sp[:2000]}
+
+{_PERSONA_JSON_SPEC}"""
+    try:
+        return _ai_persona_form(api_key, instruction)
+    except Exception as e:
+        raise HTTPException(500, f"AI 拆解失敗：{str(e)[:200]}")
 
 
 @app.get("/bots/{bot_id}/welcome")
