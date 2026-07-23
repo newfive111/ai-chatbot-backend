@@ -1389,41 +1389,96 @@ def _pb(action: str, bot_id: str, uid: str) -> str:
     return _urlparse.urlencode({"a": action, "b": bot_id, "u": uid})
 
 
+def _fmt_time(iso: str) -> str:
+    """ISO 時間 → 台北時間 MM/DD HH:MM。"""
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        off = dt.utcoffset() or timedelta()
+        dt = dt.replace(tzinfo=None) - off + timedelta(hours=8)
+        return dt.strftime("%m/%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _info_row(label: str, value: str, value_color: str = "#111111", value_weight: str = "regular") -> dict:
+    return {
+        "type": "box", "layout": "baseline", "spacing": "sm",
+        "contents": [
+            {"type": "text", "text": label, "size": "sm", "color": "#AAAAAA", "flex": 2},
+            {"type": "text", "text": value or "—", "size": "sm", "color": value_color,
+             "weight": value_weight, "flex": 5, "wrap": True},
+        ],
+    }
+
+
 def _conv_bubble(it: dict) -> dict:
     muted = it["muted"]
+    accent = "#EA580C" if muted else "#16A34A"          # 接手中橘 / AI 綠
     status = "🙋 真人接手中" if muted else "🤖 AI 自動回覆中"
     if muted:
-        toggle_btn = {"type": "button", "style": "primary", "color": "#2563eb", "height": "sm",
-                      "action": {"type": "postback", "label": "🤖 恢復 AI",
+        toggle_btn = {"type": "button", "style": "primary", "color": "#2563EB", "height": "sm",
+                      "action": {"type": "postback", "label": "🤖 恢復 AI 回覆",
                                  "data": _pb("unmute", it["bot_id"], it["uid"]),
                                  "displayText": f"恢復 AI 回覆 {it['name']}"}}
     else:
-        toggle_btn = {"type": "button", "style": "primary", "color": "#ea580c", "height": "sm",
-                      "action": {"type": "postback", "label": "🙋 接手",
+        toggle_btn = {"type": "button", "style": "primary", "color": "#EA580C", "height": "sm",
+                      "action": {"type": "postback", "label": "🙋 真人接手",
                                  "data": _pb("mute", it["bot_id"], it["uid"]),
                                  "displayText": f"接手 {it['name']}"}}
     reply_btn = {"type": "button", "style": "secondary", "height": "sm",
-                 "action": {"type": "postback", "label": "💬 代回",
+                 "action": {"type": "postback", "label": "💬 代回訊息",
                             "data": _pb("reply", it["bot_id"], it["uid"]),
                             "displayText": f"代回 {it['name']}"}}
     return {
-        "type": "bubble", "size": "kilo",
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "sm",
+        "type": "bubble", "size": "mega",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": accent,
+            "paddingAll": "16px", "spacing": "xs",
             "contents": [
-                {"type": "text", "text": it["name"], "weight": "bold", "size": "md", "wrap": True},
-                {"type": "text", "text": it["bot_name"], "size": "xs", "color": "#888888"},
-                {"type": "text", "text": (f"「{it['last_q']}」" if it["last_q"] else "（無內容）"),
-                 "size": "sm", "color": "#555555", "wrap": True},
-                {"type": "text", "text": status, "size": "xs",
-                 "color": "#ea580c" if muted else "#16a34a", "margin": "sm"},
+                {"type": "text", "text": it["name"], "weight": "bold", "size": "lg",
+                 "color": "#FFFFFF", "wrap": True},
+                {"type": "text", "text": f"🤖 {it['bot_name']}", "size": "xs", "color": "#FFFFFFCC"},
+            ],
+        },
+        "body": {
+            "type": "box", "layout": "vertical", "spacing": "md", "paddingAll": "16px",
+            "contents": [
+                _info_row("狀態", status, accent, "bold"),
+                _info_row("時間", it.get("time_label") or ""),
+                {"type": "separator", "margin": "md", "color": "#EEEEEE"},
+                {"type": "text", "text": "最後訊息", "size": "xs", "color": "#AAAAAA", "margin": "md"},
+                {"type": "text",
+                 "text": (it["last_q"] if it["last_q"] else "（無內容）"),
+                 "size": "sm", "color": "#333333", "wrap": True},
             ],
         },
         "footer": {
-            "type": "box", "layout": "vertical", "spacing": "sm",
+            "type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "12px",
             "contents": [toggle_btn, reply_btn],
         },
     }
+
+
+async def _single_conv_flex(bot_id: str, uid: str) -> dict:
+    """重建單一對話的 Flex 卡片（按鈕動作後即時回覆用）。"""
+    bot = _get_bot_config(bot_id)
+    token = bot.get("line_channel_access_token")
+    name = await fetch_line_display_name(bot_id, uid, token) or "LINE 客戶"
+    last = supabase.table("conversations").select("question, created_at") \
+        .eq("bot_id", bot_id).eq("session_id", f"line_{bot_id}_{uid}") \
+        .order("created_at", desc=True).limit(1).execute()
+    last_q, last_at = "", ""
+    if last.data:
+        last_q = (last.data[0].get("question") or "")[:40]
+        last_at = last.data[0].get("created_at") or ""
+    it = {
+        "bot_id": bot_id, "bot_name": bot.get("name") or "Bot", "uid": uid,
+        "last_q": last_q, "last_at": last_at, "time_label": _fmt_time(last_at),
+        "muted": _mute_key(bot_id, uid) in _muted_line_users, "name": name,
+    }
+    return {"type": "flex", "altText": name, "contents": _conv_bubble(it)}
 
 
 async def _build_admin_conversation_list(app_user: dict) -> list:
@@ -1452,6 +1507,7 @@ async def _build_admin_conversation_list(app_user: dict) -> list:
                 "uid": uid,
                 "last_q": (c.get("question") or "")[:40],
                 "last_at": c.get("created_at") or "",
+                "time_label": _fmt_time(c.get("created_at")),
                 "muted": _mute_key(b["id"], uid) in _muted_line_users,
                 "token": b.get("line_channel_access_token"),
             })
@@ -1491,8 +1547,9 @@ async def _admin_send_customer_reply(staff: dict, reply_token: str, pending: dic
             }).execute()
         except Exception:
             pass
+        flex = await _single_conv_flex(bot_id, uid)
         await _admin_reply(reply_token, [_admin_text_msg(
-            f"✅ 已傳給「{name}」。AI 已暫停，需要時在清單按「恢復 AI」。", _menu_quick_items())])
+            f"✅ 已傳給「{name}」。AI 已暫停，需要時按「恢復 AI 回覆」。"), flex])
     else:
         await _admin_reply(reply_token, [_admin_text_msg(f"❌ 傳送失敗（{status}），請稍後再試。")])
 
@@ -1508,13 +1565,14 @@ async def _handle_admin_postback(staff: dict, line_uid: str, reply_token: str, p
         bot_id, uid, _get_bot_config(bot_id).get("line_channel_access_token")) or "客戶"
     if action == "mute":
         add_mute(bot_id, uid, muted_by=staff["id"])
+        flex = await _single_conv_flex(bot_id, uid)
         await _admin_reply(reply_token, [_admin_text_msg(
-            f"✅ 已接手「{name}」，AI 已暫停。可按「代回」直接回覆，或到 LINE 官方帳號回覆。",
-            _menu_quick_items())])
+            f"✅ 已接手「{name}」，AI 已暫停。可按「代回訊息」直接回覆。"), flex])
     elif action == "unmute":
         remove_mute(bot_id, uid)
+        flex = await _single_conv_flex(bot_id, uid)
         await _admin_reply(reply_token, [_admin_text_msg(
-            f"✅ 已恢復「{name}」的 AI 自動回覆。", _menu_quick_items())])
+            f"✅ 已恢復「{name}」的 AI 自動回覆。"), flex])
     elif action == "reply":
         _admin_pending_reply[line_uid] = {"bot_id": bot_id, "uid": uid, "name": name}
         await _admin_reply(reply_token, [_admin_text_msg(
