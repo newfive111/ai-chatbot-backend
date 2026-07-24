@@ -1512,6 +1512,9 @@ import urllib.parse as _urlparse
 # key = 管理 bot 的 line userId -> {"bot_id":..., "uid":..., "name":...}
 _admin_pending_reply: Dict[str, dict] = {}
 
+# 剛綁定完、正在等對方回覆「怎麼稱呼」的暫存（key = 管理 bot 的 line userId）
+_admin_pending_name: Dict[str, bool] = {}
+
 
 async def _admin_push(to: str, messages: list) -> int:
     """用管理 bot 主動推播（支援 Flex / 多則訊息）。"""
@@ -1840,9 +1843,9 @@ async def _handle_admin_event(event: dict):
             # 加好友即嘗試自動綁定（同 provider 的 LINE 登入身分），免 6 碼
             auto = _autobind_staff_by_line(line_uid)
             if auto:
+                _admin_pending_name[line_uid] = True
                 await _admin_reply(reply_token, [_admin_text_msg(
-                    f"✅ 已自動綁定，{auto.get('display_name') or ''}！輸入「清單」查看可接手的對話。",
-                    _menu_quick_items())])
+                    "✅ 綁定成功！請問我該怎麼稱呼你？（直接回覆你的稱呼即可，例如：小明、王經理）")])
             else:
                 await _admin_reply(reply_token, [_admin_text_msg(
                     "歡迎使用懶得回管理助手 🤖\n\n請先綁定身分：登入後台 →「團隊成員」頁 → 點「綁定我的 LINE」"
@@ -1864,12 +1867,27 @@ async def _handle_admin_event(event: dict):
             # 先試自動綁定（LINE 登入身分），再退回 6 碼綁定碼
             bound = _autobind_staff_by_line(line_uid) or _try_bind_staff(line_uid, text)
             if bound:
+                _admin_pending_name[line_uid] = True
                 await _admin_reply(reply_token, [_admin_text_msg(
-                    f"✅ 綁定成功，{bound.get('display_name') or ''}！輸入「清單」查看可接手的對話。",
-                    _menu_quick_items())])
+                    "✅ 綁定成功！請問我該怎麼稱呼你？（直接回覆你的稱呼即可，例如：小明、王經理）")])
             else:
                 await _admin_reply(reply_token, [_admin_text_msg(
                     "尚未綁定。請到後台「團隊成員」頁點「綁定我的 LINE」取得 6 碼綁定碼，傳給我完成綁定。")])
+            return
+
+        # 剛綁定完，這則訊息當作「怎麼稱呼」的回覆
+        if _admin_pending_name.pop(line_uid, None):
+            name = text.strip()[:40]
+            if name and name not in ["清單", "選單", "menu", "list", "對話", "跳過", "skip"]:
+                try:
+                    supabase.table("app_users").update({"display_name": name}).eq("id", staff["id"]).execute()
+                except Exception:
+                    pass
+                await _admin_reply(reply_token, [_admin_text_msg(
+                    f"好的，之後就稱呼你「{name}」😊 輸入「清單」查看可接手的對話。", _menu_quick_items())])
+            else:
+                await _admin_reply(reply_token, [_admin_text_msg(
+                    "好的，先跳過稱呼。輸入「清單」查看可接手的對話。", _menu_quick_items())])
             return
 
         pending = _admin_pending_reply.pop(line_uid, None)
