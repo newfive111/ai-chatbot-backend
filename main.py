@@ -3121,6 +3121,42 @@ async def admin_extend_subscription(
     return {"ok": True, "user_id": target_user_id, "renews_at": new_renews}
 
 
+@app.get("/admin/orgs-map")
+async def admin_orgs_map(authorization: Optional[str] = Header(None)):
+    """唯讀診斷：列出所有團隊、擁有者、成員，用來釐清「同一人多帳號 / 成員跑錯團隊」。"""
+    require_admin(authorization)
+    users = supabase.table("app_users").select(
+        "id, email, display_name, line_user_id"
+    ).execute().data or []
+    umap = {u["id"]: u for u in users}
+    orgs = supabase.table("organizations").select("id, name, owner_id").execute().data or []
+    mships = supabase.table("memberships").select("org_id, user_id, role").execute().data or []
+    by_org: dict = {}
+    for m in mships:
+        by_org.setdefault(m["org_id"], []).append(m)
+
+    def _label(u: dict) -> str:
+        return (u.get("email") or u.get("display_name") or "—")
+
+    result = []
+    for o in orgs:
+        owner = umap.get(o["owner_id"], {})
+        members = []
+        for m in by_org.get(o["id"], []):
+            mu = umap.get(m["user_id"], {})
+            members.append({"role": m["role"], "label": _label(mu)})
+        members.sort(key=lambda x: (x["role"] != "owner", x["label"]))
+        result.append({
+            "org_id":      o["id"],
+            "org_name":    o["name"],
+            "owner_label": _label(owner),
+            "member_count": len(members),
+            "members":     members,
+        })
+    result.sort(key=lambda x: (-x["member_count"], x["owner_label"]))
+    return result
+
+
 class AdminNoteUpdate(BaseModel):
     note: str = ""
 
