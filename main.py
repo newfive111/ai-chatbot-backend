@@ -379,7 +379,7 @@ async def list_my_orgs(authorization: Optional[str] = Header(None)):
 @app.get("/orgs/{org_id}/members")
 async def list_members(org_id: str, authorization: Optional[str] = Header(None)):
     require_org_access(org_id, authorization, min_role="viewer")
-    rows = supabase.table("memberships").select("id, user_id, role, created_at") \
+    rows = supabase.table("memberships").select("id, user_id, role, created_at, note") \
         .eq("org_id", org_id).order("created_at").execute()
     members = rows.data or []
     user_ids = [m["user_id"] for m in members]
@@ -393,6 +393,7 @@ async def list_members(org_id: str, authorization: Optional[str] = Header(None))
         m["display_name"] = u.get("display_name") or u.get("email") or "使用者"
         m["email"] = u.get("email")
         m["picture_url"] = u.get("picture_url")
+        m["note"] = m.get("note") or ""
     return members
 
 
@@ -415,6 +416,25 @@ async def update_member(org_id: str, member_user_id: str, body: UpdateMemberRequ
     supabase.table("memberships").update({"role": body.role}) \
         .eq("org_id", org_id).eq("user_id", member_user_id).execute()
     return {"ok": True}
+
+
+class UpdateMemberNoteRequest(BaseModel):
+    note: str = ""
+
+
+@app.patch("/orgs/{org_id}/members/{member_user_id}/note")
+async def update_member_note(org_id: str, member_user_id: str, body: UpdateMemberNoteRequest,
+                             authorization: Optional[str] = Header(None)):
+    """幫團隊成員加備注（例：這支 LINE 是誰的），存在 membership.note，只在此團隊內顯示。"""
+    require_org_access(org_id, authorization, min_role="admin")
+    target = supabase.table("memberships").select("id") \
+        .eq("org_id", org_id).eq("user_id", member_user_id).execute()
+    if not target.data:
+        raise HTTPException(404, "成員不存在")
+    note = (body.note or "")[:200]
+    supabase.table("memberships").update({"note": note}) \
+        .eq("org_id", org_id).eq("user_id", member_user_id).execute()
+    return {"ok": True, "note": note}
 
 
 @app.delete("/orgs/{org_id}/members/{member_user_id}")
