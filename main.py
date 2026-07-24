@@ -1472,6 +1472,9 @@ async def line_webhook(bot_id: str, request: Request):
             logging.info(f"[LINE] Spam-muted {user_id}: {user_msg[:30]}...")
             continue
 
+        # ── 關鍵字警示（主動通知 owner/admin，非阻塞）──
+        asyncio.create_task(_fire_keyword_alert(bot_id, user_id, user_msg))
+
         # ── 防抖緩衝（15 秒）──
         if buf_key in _line_buffers:
             # 取消舊計時器，累積訊息
@@ -1537,6 +1540,133 @@ async def _admin_reply(reply_token: str, messages: list) -> int:
             json={"replyToken": reply_token, "messages": messages[:5]},
         )
         return resp.status_code
+
+
+def _line_id_for_app_user(app_user_id: str) -> Optional[str]:
+    """某個後台帳號可用管理助手推播的 LINE userId：優先 staff_line，其次 app_users.line_user_id。"""
+    try:
+        sl = supabase.table("staff_line").select("line_user_id").eq("app_user_id", app_user_id).execute()
+        if sl.data and sl.data[0].get("line_user_id"):
+            return sl.data[0]["line_user_id"]
+        au = supabase.table("app_users").select("line_user_id").eq("id", app_user_id).execute()
+        return au.data[0].get("line_user_id") if au.data else None
+    except Exception:
+        return None
+
+
+def _org_notify_line_ids(bot_id: str, roles=("owner", "admin")) -> list:
+    """這個 bot 所屬團隊裡、指定角色、且有綁 LINE 的成員的 LINE userId（去重）。"""
+    try:
+        b = supabase.table("bots").select("org_id").eq("id", bot_id).execute()
+        org_id = b.data[0].get("org_id") if b.data else None
+        if not org_id:
+            return []
+        mems = supabase.table("memberships").select("user_id, role") \
+            .eq("org_id", org_id).in_("role", list(roles)).execute().data or []
+        ids, seen = [], set()
+        for m in mems:
+            lid = _line_id_for_app_user(m["user_id"])
+            if lid and lid not in seen:
+                seen.add(lid)
+                ids.append(lid)
+        return ids
+    except Exception as e:
+        logging.warning(f"[notify] resolve org line ids failed: {e}")
+        return []
+
+
+def _muted_by_name_map(bot_id: str, uids: list) -> dict:
+    """回傳 {line_user_id: 接手者顯示名稱}，供防撞單顯示是誰接手的。"""
+    if not uids:
+        return {}
+    try:
+        rows = supabase.table("chat_mutes").select("line_user_id, muted_by") \
+            .eq("bot_id", bot_id).in_("line_user_id", uids).execute().data or []
+        by_ids = list({r["muted_by"] for r in rows if r.get("muted_by")})
+        name_by_id = {}
+        if by_ids:
+            us = supabase.table("app_users").select("id, display_name, email") \
+                .in_("id", by_ids).execute().data or []
+            name_by_id = {u["id"]: (u.get("display_name") or u.get("email") or "員工") for u in us}
+        out = {}
+        for r in rows:
+            if r.get("muted_by"):
+                out[r["line_user_id"]] = name_by_id.get(r["muted_by"], "員工")
+        return out
+    except Exception:
+        return {}
+
+
+def _customer_background(bot_id: str, uid: str) -> str:
+    """接手時給員工的客戶背景：最近幾則問答 + 該 bot 要收集的聯絡欄位提示。"""
+    lines = []
+    try:
+        rows = supabase.table("conversations") \
+            .select("question, answer, created_at") \
+            .eq("bot_id", bot_id).eq("session_id", f"line_{bot_id}_{uid}") \
+            .order("created_at", desc=True).limit(5).execute().data or []
+        rows = list(reversed(rows))  # 由舊到新，讀起來順
+        for c in rows:
+            q = (c.get("question") or "").strip().replace("\n", " ")[:60]
+            a = (c.get("answer") or "").strip().replace("\n", " ")[:60]
+            if q:
+                lines.append(f"👤 {q}")
+            if a:
+                lines.append(f"🤖 {a}")
+    except Exception:
+        pass
+    header = "📋 客戶背景（最近對話）"
+    body = "\n".join(lines) if lines else "（尚無對話紀錄）"
+    try:
+        bot = _get_bot_config(bot_id)
+        fields = bot.get("collect_fields") or []
+        labels = [f.get("label") or f.get("name") for f in fields if isinstance(f, dict)]
+        labels = [x for x in labels if x]
+        if labels:
+            body += f"\n\n📝 需收集：{ '、'.join(labels) }"
+    except Exception:
+        pass
+    return f"{header}\n{body}"
+
+
+# 客戶訊息含這些字 → 管理助手主動警示 owner+admin
+_ALERT_KEYWORDS = ["退費", "退款", "退貨", "客訴", "投訴", "不要了", "太貴",
+                   "很爛", "爛透", "律師", "檢舉", "詐騙", "生氣", "失望"]
+_alert_last: Dict[str, float] = {}   # key=bot|uid -> 上次警示 epoch 秒
+_ALERT_COOLDOWN = 600                 # 同一位客戶 10 分鐘內只警示一次
+
+
+async def _fire_keyword_alert(bot_id: str, uid: str, user_msg: str):
+    """客戶訊息命中敏感詞時，主動推播警示給 owner+admin（附對話卡可直接接手）。"""
+    hit = next((k for k in _ALERT_KEYWORDS if k in user_msg), None)
+    if not hit:
+        return
+    import time as _time
+    key = f"{bot_id}|{uid}"
+    now = _time.time()
+    if now - _alert_last.get(key, 0) < _ALERT_COOLDOWN:
+        return
+    _alert_last[key] = now
+    targets = _org_notify_line_ids(bot_id, roles=("owner", "admin"))
+    if not targets:
+        return
+    try:
+        name = await fetch_line_display_name(
+            bot_id, uid, _get_bot_config(bot_id).get("line_channel_access_token")) or "LINE 客戶"
+    except Exception:
+        name = "LINE 客戶"
+    alert = _admin_text_msg(
+        f"⚠️ 關鍵字警示\n客戶「{name}」提到「{hit}」：\n「{user_msg[:60]}」\n可直接接手或代回 👇")
+    try:
+        flex = await _single_conv_flex(bot_id, uid)
+    except Exception:
+        flex = None
+    msgs = [alert] + ([flex] if flex else [])
+    for lid in targets:
+        try:
+            await _admin_push(lid, msgs)
+        except Exception as e:
+            logging.warning(f"[alert] push failed: {e}")
 
 
 def _menu_quick_items() -> list:
@@ -1667,7 +1797,11 @@ def _info_row(label: str, value: str, value_color: str = "#111111", value_weight
 def _conv_bubble(it: dict) -> dict:
     muted = it["muted"]
     accent = "#EA580C" if muted else "#16A34A"          # 接手中橘 / AI 綠
-    status = "🙋 真人接手中" if muted else "🤖 AI 自動回覆中"
+    if muted:
+        who = it.get("muted_by_name")
+        status = f"🙋 {who} 接手中" if who else "🙋 真人接手中"
+    else:
+        status = "🤖 AI 自動回覆中"
     if muted:
         toggle_btn = {"type": "button", "style": "primary", "color": "#2563EB", "height": "sm",
                       "action": {"type": "postback", "label": "🤖 恢復 AI 回覆",
@@ -1724,10 +1858,12 @@ async def _single_conv_flex(bot_id: str, uid: str) -> dict:
     if last.data:
         last_q = (last.data[0].get("question") or "")[:40]
         last_at = last.data[0].get("created_at") or ""
+    muted = _mute_key(bot_id, uid) in _muted_line_users
     it = {
         "bot_id": bot_id, "bot_name": bot.get("name") or "Bot", "uid": uid,
         "last_q": last_q, "last_at": last_at, "time_label": _fmt_time(last_at),
-        "muted": _mute_key(bot_id, uid) in _muted_line_users, "name": name,
+        "muted": muted, "name": name,
+        "muted_by_name": _muted_by_name_map(bot_id, [uid]).get(uid) if muted else None,
     }
     return {"type": "flex", "altText": name, "contents": _conv_bubble(it)}
 
@@ -1767,8 +1903,19 @@ async def _build_admin_conversation_list(app_user: dict) -> list:
 
     items.sort(key=lambda x: x["last_at"], reverse=True)
     items = items[:10]
+    # 防撞單：查出每個已接手對話是誰接手的
+    by_bot: dict = {}
+    for it in items:
+        if it.get("muted"):
+            by_bot.setdefault(it["bot_id"], []).append(it["uid"])
+    name_map: dict = {}
+    for bid, uids in by_bot.items():
+        for k, v in _muted_by_name_map(bid, uids).items():
+            name_map[(bid, k)] = v
     for it in items:
         it["name"] = await fetch_line_display_name(it["bot_id"], it["uid"], it["token"]) or "LINE 客戶"
+        if it.get("muted"):
+            it["muted_by_name"] = name_map.get((it["bot_id"], it["uid"]))
 
     flex = {
         "type": "flex",
@@ -1817,8 +1964,10 @@ async def _handle_admin_postback(staff: dict, line_uid: str, reply_token: str, p
     if action == "mute":
         add_mute(bot_id, uid, muted_by=staff["id"])
         flex = await _single_conv_flex(bot_id, uid)
+        bg = _customer_background(bot_id, uid)
         await _admin_reply(reply_token, [_admin_text_msg(
-            f"✅ 已接手「{name}」，AI 已暫停。可按「代回訊息」直接回覆。"), flex])
+            f"✅ 已接手「{name}」，AI 已暫停。可按「代回訊息」直接回覆。"),
+            _admin_text_msg(bg), flex])
     elif action == "unmute":
         remove_mute(bot_id, uid)
         flex = await _single_conv_flex(bot_id, uid)
@@ -1826,8 +1975,10 @@ async def _handle_admin_postback(staff: dict, line_uid: str, reply_token: str, p
             f"✅ 已恢復「{name}」的 AI 自動回覆。"), flex])
     elif action == "reply":
         _admin_pending_reply[line_uid] = {"bot_id": bot_id, "uid": uid, "name": name}
-        await _admin_reply(reply_token, [_admin_text_msg(
-            f"請輸入要傳給「{name}」的訊息（輸入「取消」放棄）：")])
+        bg = _customer_background(bot_id, uid)
+        await _admin_reply(reply_token, [
+            _admin_text_msg(bg),
+            _admin_text_msg(f"請輸入要傳給「{name}」的訊息（輸入「取消」放棄）：")])
 
 
 async def _handle_admin_event(event: dict):
@@ -3358,11 +3509,70 @@ async def _expiry_warning_tick():
             logging.warning(f"[Expiry] push failed for {sub['id']}: {e}")
 
 
+_daily_summary_date: Optional[str] = None  # 已發送摘要的台北日期 YYYY-MM-DD
+
+
+async def _daily_summary_tick():
+    """台北時間 21 點，推當日營運摘要給各團隊 owner（一天一次）。"""
+    global _daily_summary_date
+    if not ADMIN_LINE_CHANNEL_ACCESS_TOKEN:
+        return
+    tpe = datetime.utcnow() + timedelta(hours=8)
+    today = tpe.strftime("%Y-%m-%d")
+    if tpe.hour != 21 or _daily_summary_date == today:
+        return
+    _daily_summary_date = today
+    # 今日台北 00:00 換算成 UTC 字串，跟 conversations.created_at 比對
+    start_utc = (datetime.strptime(today, "%Y-%m-%d") - timedelta(hours=8)).isoformat()
+    try:
+        orgs = supabase.table("organizations").select("id, name, owner_id").execute().data or []
+    except Exception as e:
+        logging.warning(f"[Summary] orgs query failed: {e}")
+        return
+    for org in orgs:
+        owner_id = org.get("owner_id")
+        if not owner_id:
+            continue
+        line_id = _line_id_for_app_user(owner_id)
+        if not line_id:
+            continue
+        try:
+            bots = supabase.table("bots").select("id").eq("org_id", org["id"]).execute().data or []
+            bot_ids = [b["id"] for b in bots]
+            if not bot_ids:
+                continue
+            rows = supabase.table("conversations").select("session_id, question") \
+                .in_("bot_id", bot_ids).gte("created_at", start_utc).execute().data or []
+        except Exception as e:
+            logging.warning(f"[Summary] stats failed org={org['id']}: {e}")
+            continue
+        total = len(rows)
+        if total == 0:
+            continue
+        customers = len({r.get("session_id") for r in rows if r.get("session_id")})
+        handoffs = sum(1 for r in rows if "代回" in (r.get("question") or ""))
+        msg = (
+            f"📊 今日營運摘要（{today}）\n\n"
+            f"👥 客戶數：{customers} 位\n"
+            f"💬 對話則數：{total} 則\n"
+            f"🙋 真人代回：{handoffs} 則\n\n"
+            f"辛苦了，明天繼續加油 💪"
+        )
+        try:
+            await _admin_push(line_id, [_admin_text_msg(msg)])
+        except Exception as e:
+            logging.warning(f"[Summary] push failed org={org['id']}: {e}")
+
+
 async def _expiry_scheduler_loop():
-    """每小時檢查一次訂閱到期。"""
+    """每小時檢查一次訂閱到期 + 每日營運摘要。"""
     while True:
         try:
             await _expiry_warning_tick()
         except Exception as e:
             logging.warning(f"[Expiry] tick error: {e}")
+        try:
+            await _daily_summary_tick()
+        except Exception as e:
+            logging.warning(f"[Summary] tick error: {e}")
         await asyncio.sleep(3600)
