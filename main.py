@@ -239,7 +239,8 @@ async def line_login_start():
         "client_id": LINE_LOGIN_CHANNEL_ID,
         "redirect_uri": f"{BACKEND_BASE_URL}/auth/line/callback",
         "state": state,
-        "scope": "profile openid email",
+        # 只要 profile + openid；不要 email（LINE 需另外申請 Email 權限，後端會自動合成 email）
+        "scope": "profile openid",
     }
     auth_url = "https://access.line.me/oauth2/v2.1/authorize?" + urlencode(params)
     return {"auth_url": auth_url}
