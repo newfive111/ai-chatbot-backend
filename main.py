@@ -623,7 +623,9 @@ _ROLE_RANK = {"viewer": 1, "editor": 2, "admin": 3, "owner": 4}
 def ensure_app_user(supabase_uid: str = None, email: str = "",
                     line_user_id: str = None, display_name: str = "",
                     picture_url: str = "") -> dict:
-    """確保 app_users 有這位使用者，沒有就建立，並自動建立個人團隊 + owner membership（冪等）。"""
+    """確保 app_users 有這位使用者，沒有就建立（冪等）。
+    注意：不再自動建立個人團隊。個人團隊改為「真的需要時」才建（見 ensure_personal_org），
+    避免只是透過邀請加入別人團隊的成員（尤其 LINE 登入員工）也被開一堆空團隊。"""
     row = None
     if line_user_id:
         r = supabase.table("app_users").select("*").eq("line_user_id", line_user_id).execute()
@@ -656,18 +658,25 @@ def ensure_app_user(supabase_uid: str = None, email: str = "",
             supabase.table("app_users").update(patch).eq("id", row["id"]).execute()
             row.update(patch)
 
-    # 確保有個人團隊 + owner membership
-    org = supabase.table("organizations").select("id").eq("owner_id", row["id"]).limit(1).execute()
-    if not org.data:
-        org_name = row.get("display_name") or "我的團隊"
-        new_org = supabase.table("organizations").insert(
-            {"name": org_name, "owner_id": row["id"]}
-        ).execute().data[0]
-        supabase.table("memberships").insert(
-            {"org_id": new_org["id"], "user_id": row["id"], "role": "owner"}
-        ).execute()
-
     return row
+
+
+def ensure_personal_org(app_user: dict) -> str:
+    """確保這位使用者有自己的個人團隊（owner），沒有就建立。回傳 org_id。
+    只在使用者真的需要當 owner 時呼叫（例如建立第一個 bot），
+    純粹被邀請加入別人團隊的成員不會被開個人團隊。"""
+    owned = supabase.table("organizations").select("id") \
+        .eq("owner_id", app_user["id"]).limit(1).execute()
+    if owned.data:
+        return owned.data[0]["id"]
+    org_name = app_user.get("display_name") or "我的團隊"
+    new_org = supabase.table("organizations").insert(
+        {"name": org_name, "owner_id": app_user["id"]}
+    ).execute().data[0]
+    supabase.table("memberships").insert(
+        {"org_id": new_org["id"], "user_id": app_user["id"], "role": "owner"}
+    ).execute()
+    return new_org["id"]
 
 
 def get_app_user(authorization: str = None) -> dict:
@@ -700,21 +709,6 @@ def get_membership_role(org_id: str, app_user_id: str) -> Optional[str]:
     r = supabase.table("memberships").select("role") \
         .eq("org_id", org_id).eq("user_id", app_user_id).execute()
     return r.data[0]["role"] if r.data else None
-
-
-def get_primary_org_id(app_user: dict) -> str:
-    """使用者的主要團隊：優先自己擁有的個人團隊，否則第一個所屬團隊。"""
-    owned = supabase.table("organizations").select("id") \
-        .eq("owner_id", app_user["id"]).limit(1).execute()
-    if owned.data:
-        return owned.data[0]["id"]
-    org_ids = get_user_org_ids(app_user["id"])
-    if org_ids:
-        return org_ids[0]
-    ensure_app_user(supabase_uid=app_user.get("supabase_uid"), email=app_user.get("email") or "")
-    owned = supabase.table("organizations").select("id") \
-        .eq("owner_id", app_user["id"]).limit(1).execute()
-    return owned.data[0]["id"]
 
 
 def _org_owner_uid(org: dict) -> Optional[str]:
@@ -773,7 +767,8 @@ async def create_bot(
     authorization: Optional[str] = Header(None)
 ):
     app_user = get_app_user(authorization)
-    org_id = get_primary_org_id(app_user)
+    # 建 bot 的人 = 自己團隊的 owner；沒有個人團隊才 lazy 建立（不會動到被邀請加入的別人團隊）
+    org_id = ensure_personal_org(app_user)
     user_id = app_user.get("supabase_uid") or get_user_id(authorization)
 
     # 限制：免費 1 個，每個付費訂閱 +1（依團隊計算）
