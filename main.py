@@ -3081,6 +3081,40 @@ async def admin_stats(authorization: Optional[str] = Header(None)):
     }
 
 
+@app.get("/admin/assistant-engine")
+async def admin_assistant_engine(authorization: Optional[str] = Header(None)):
+    """診斷小懶目前實際走哪個引擎：回報後端有沒有讀到 PLATFORM_ANTHROPIC_KEY，
+    並對 Claude 做一次最小 ping，把真正的錯誤吐出來（唯讀，不改任何資料）。"""
+    require_admin(authorization)
+    from app.config import PLATFORM_ANTHROPIC_KEY, ASSISTANT_CLAUDE_MODEL
+    key = PLATFORM_ANTHROPIC_KEY or ""
+    out = {
+        "key_present": bool(key),
+        "key_prefix":  (key[:7] + "…" + key[-4:]) if len(key) > 12 else ("(空)" if not key else "(太短)"),
+        "model":       ASSISTANT_CLAUDE_MODEL,
+        "engine":      "claude" if key else "gemini",
+        "ping_ok":     None,
+        "ping_error":  None,
+    }
+    if key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=key)
+            resp = client.messages.create(
+                model=ASSISTANT_CLAUDE_MODEL,
+                max_tokens=8,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            out["ping_ok"] = True
+            out["ping_reply"] = "".join(
+                b.text for b in resp.content if getattr(b, "type", "") == "text"
+            )[:40]
+        except Exception as e:
+            out["ping_ok"] = False
+            out["ping_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+    return out
+
+
 @app.get("/admin/users")
 async def admin_list_users(authorization: Optional[str] = Header(None)):
     require_admin(authorization)
