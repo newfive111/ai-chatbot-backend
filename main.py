@@ -3000,27 +3000,78 @@ def require_admin(authorization: str = None) -> str:
     return user_id
 
 
+def _admin_collect_users() -> list:
+    """組出後台用戶清單，資料來源改用我們自己的 app_users 表（快、穩），
+    不再依賴慢又常逾時的 Supabase Auth list_users()。每一步都防禦性處理，絕不 500。"""
+    # app_users：我們自己維護的使用者表（含 email / supabase_uid / 顯示名稱）
+    try:
+        au_rows = supabase.table("app_users").select(
+            "id, email, supabase_uid, display_name, created_at"
+        ).execute().data or []
+    except Exception as e:
+        logging.warning(f"[Admin] app_users query failed: {e}")
+        au_rows = []
+
+    # bot_subscriptions：每個 supabase uid 的有效名額 + 最近到期日
+    slots_map: dict = {}
+    renews_map: dict = {}
+    try:
+        subs_rows = supabase.table("bot_subscriptions").select(
+            "user_id, slots, status, renews_at"
+        ).eq("status", "active").execute().data or []
+        for r in subs_rows:
+            if not _sub_is_valid(r):   # 過期的不算，跟付費牆一致
+                continue
+            uid = r["user_id"]
+            slots_map[uid] = slots_map.get(uid, 0) + (r.get("slots") or 1)
+            if not renews_map.get(uid):
+                renews_map[uid] = r.get("renews_at")
+    except Exception as e:
+        logging.warning(f"[Admin] subscriptions query failed: {e}")
+
+    # bots：每個 supabase uid 開了幾隻
+    bot_count: dict = {}
+    try:
+        for b in (supabase.table("bots").select("user_id").execute().data or []):
+            uid = b.get("user_id")
+            if uid:
+                bot_count[uid] = bot_count.get(uid, 0) + 1
+    except Exception as e:
+        logging.warning(f"[Admin] bots query failed: {e}")
+
+    result = []
+    for u in au_rows:
+        suid = u.get("supabase_uid")
+        # 名額/bot 數以 supabase uid 為 key（訂閱與 bot 都存 supabase uid）
+        slots = slots_map.get(suid, 0) if suid else 0
+        result.append({
+            "user_id":    suid or u.get("id"),   # 給前端做延長/授權用（優先 supabase uid）
+            "email":      u.get("email") or u.get("display_name") or "—",
+            "created_at": str(u.get("created_at") or ""),
+            "bot_slots":  slots,
+            "max_bots":   1 + slots,
+            "bots_used":  bot_count.get(suid, 0) if suid else 0,
+            "renews_at":  renews_map.get(suid) if suid else None,
+        })
+
+    result.sort(key=lambda x: x["created_at"], reverse=True)
+    return result
+
+
 @app.get("/admin/stats")
 async def admin_stats(authorization: Optional[str] = Header(None)):
     require_admin(authorization)
-    users = _admin.auth.admin.list_users()
-    total_users = len(users) if isinstance(users, list) else 0
-    bots = supabase.table("bots").select("id", count="exact").execute()
-
-    # 付費用戶 = 有至少一筆 active bot_subscriptions 的用戶
+    users = _admin_collect_users()
+    total_bots = 0
     try:
-        bot_subs = supabase.table("bot_subscriptions").select("user_id").eq("status", "active").execute()
-        paid_user_ids = set(r["user_id"] for r in (bot_subs.data or []))
-        paid_users = len(paid_user_ids)
-        all_subs = supabase.table("bot_subscriptions").select("slots").eq("status", "active").execute()
-        total_slots = sum(r.get("slots", 1) for r in (all_subs.data or []))
+        total_bots = supabase.table("bots").select("id", count="exact").execute().count or 0
     except Exception:
-        paid_users = 0
-        total_slots = 0
-
+        pass
+    paid_users  = sum(1 for u in users if u["bot_slots"] > 0)
+    total_slots = sum(u["bot_slots"] for u in users)
     return {
-        "total_users": total_users,
-        "total_bots":  bots.count or 0,
+        "total_users": len(users),
+        "total_bots":  total_bots,
         "paid_users":  paid_users,
         "total_slots": total_slots,
     }
@@ -3029,44 +3080,7 @@ async def admin_stats(authorization: Optional[str] = Header(None)):
 @app.get("/admin/users")
 async def admin_list_users(authorization: Optional[str] = Header(None)):
     require_admin(authorization)
-    users = _admin.auth.admin.list_users()
-    user_list = users if isinstance(users, list) else []
-
-    # bot_subscriptions: 每個用戶的 active slots 總和
-    slots_map: dict = {}
-    renews_map: dict = {}
-    try:
-        subs_rows = supabase.table("bot_subscriptions").select("user_id, slots, status, renews_at").eq("status", "active").execute()
-        for r in (subs_rows.data or []):
-            uid = r["user_id"]
-            slots_map[uid] = slots_map.get(uid, 0) + r.get("slots", 1)
-            if not renews_map.get(uid):
-                renews_map[uid] = r.get("renews_at")
-    except Exception:
-        pass
-
-    bots_rows = supabase.table("bots").select("user_id").execute()
-    bot_count: dict = {}
-    for b in (bots_rows.data or []):
-        uid = b["user_id"]
-        bot_count[uid] = bot_count.get(uid, 0) + 1
-
-    result = []
-    for u in user_list:
-        uid = u.id
-        slots = slots_map.get(uid, 0)
-        result.append({
-            "user_id":    uid,
-            "email":      u.email,
-            "created_at": str(u.created_at),
-            "bot_slots":  slots,
-            "max_bots":   1 + slots,
-            "bots_used":  bot_count.get(uid, 0),
-            "renews_at":  renews_map.get(uid),
-        })
-
-    result.sort(key=lambda x: x["created_at"], reverse=True)
-    return result
+    return _admin_collect_users()
 
 
 class AdminSlotsUpdate(BaseModel):
