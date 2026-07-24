@@ -1578,6 +1578,26 @@ def _staff_bots(app_user: dict) -> list:
     return list(seen.values())
 
 
+def _autobind_staff_by_line(line_user_id: str) -> Optional[dict]:
+    """免 6 碼自動綁定：若這支 LINE userId 已對應到某個後台帳號
+    （同 provider 的 LINE 登入時存進 app_users.line_user_id），
+    直接建立 staff_line 完成綁定。找不到回 None。"""
+    if not line_user_id:
+        return None
+    try:
+        au = supabase.table("app_users").select("*").eq("line_user_id", line_user_id).execute()
+        if not au.data:
+            return None
+        app_user = au.data[0]
+        supabase.table("staff_line").upsert(
+            {"line_user_id": line_user_id, "app_user_id": app_user["id"]},
+            on_conflict="line_user_id",
+        ).execute()
+        return app_user
+    except Exception:
+        return None
+
+
 def _try_bind_staff(line_user_id: str, text: str) -> Optional[dict]:
     """用綁定碼把員工 LINE 綁到 app_user，成功回 app_user，失敗回 None。"""
     import re
@@ -1817,9 +1837,16 @@ async def _handle_admin_event(event: dict):
                 f"歡迎回來，{staff.get('display_name') or ''}！輸入「清單」查看可接手的對話。",
                 _menu_quick_items())])
         else:
-            await _admin_reply(reply_token, [_admin_text_msg(
-                "歡迎使用懶得回管理助手 🤖\n\n請先綁定身分：登入後台 →「團隊成員」頁 → 點「綁定我的 LINE」"
-                "取得 6 碼綁定碼，把數字傳給我即可完成綁定。")])
+            # 加好友即嘗試自動綁定（同 provider 的 LINE 登入身分），免 6 碼
+            auto = _autobind_staff_by_line(line_uid)
+            if auto:
+                await _admin_reply(reply_token, [_admin_text_msg(
+                    f"✅ 已自動綁定，{auto.get('display_name') or ''}！輸入「清單」查看可接手的對話。",
+                    _menu_quick_items())])
+            else:
+                await _admin_reply(reply_token, [_admin_text_msg(
+                    "歡迎使用懶得回管理助手 🤖\n\n請先綁定身分：登入後台 →「團隊成員」頁 → 點「綁定我的 LINE」"
+                    "取得 6 碼綁定碼，把數字傳給我即可完成綁定。")])
         return
 
     if etype == "postback":
@@ -1834,7 +1861,8 @@ async def _handle_admin_event(event: dict):
         text = event["message"]["text"].strip()
 
         if not staff:
-            bound = _try_bind_staff(line_uid, text)
+            # 先試自動綁定（LINE 登入身分），再退回 6 碼綁定碼
+            bound = _autobind_staff_by_line(line_uid) or _try_bind_staff(line_uid, text)
             if bound:
                 await _admin_reply(reply_token, [_admin_text_msg(
                     f"✅ 綁定成功，{bound.get('display_name') or ''}！輸入「清單」查看可接手的對話。",
