@@ -1203,6 +1203,69 @@ async def chat(bot_id: str, body: ChatRequest):
 
 
 # ──────────────────────────────────────
+# LINE 連線測試 + 自動設定 Webhook（簡化綁定）
+# ──────────────────────────────────────
+
+@app.post("/bots/{bot_id}/line/verify")
+async def line_verify_and_setup(bot_id: str, authorization: Optional[str] = Header(None)):
+    """用已存的 token 驗證 LINE 連線 → 回傳 OA 名稱/頭像，並自動幫忙設定 Webhook。"""
+    require_bot_access(bot_id, authorization, min_role="editor")
+    bot = _get_bot_config(bot_id)
+    token = bot.get("line_channel_access_token")
+    if not token:
+        raise HTTPException(400, "請先儲存 Channel Access Token 再測試")
+
+    headers = {"Authorization": f"Bearer {token}"}
+    webhook_url = f"{BACKEND_BASE_URL}/line/webhook/{bot_id}"
+    result: dict = {"ok": False, "oa_name": None, "oa_picture": None,
+                    "webhook_set": False, "webhook_active": False, "warnings": []}
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        # 1) 驗證 token + 取得 OA 資料
+        try:
+            info = await client.get("https://api.line.me/v2/bot/info", headers=headers)
+        except Exception as e:
+            raise HTTPException(502, f"連線 LINE 失敗：{str(e)[:120]}")
+        if info.status_code == 401:
+            raise HTTPException(400, "Channel Access Token 無效或已過期，請重新從 LINE 後台 Issue 一組再貼上")
+        if info.status_code != 200:
+            raise HTTPException(400, f"LINE 驗證失敗（{info.status_code}），請確認 token 是否正確")
+        j = info.json()
+        result["ok"] = True
+        result["oa_name"] = j.get("displayName")
+        result["oa_picture"] = j.get("pictureUrl")
+
+        # 2) 自動設定 Webhook URL
+        try:
+            r = await client.put(
+                "https://api.line.me/v2/bot/channel/webhook/endpoint",
+                headers={**headers, "Content-Type": "application/json"},
+                json={"endpoint": webhook_url},
+            )
+            result["webhook_set"] = r.status_code == 200
+            if r.status_code != 200:
+                result["warnings"].append("無法自動設定 Webhook URL，請手動貼到 LINE 後台")
+        except Exception:
+            result["warnings"].append("無法自動設定 Webhook URL，請手動貼到 LINE 後台")
+
+        # 3) 測試 Webhook 是否可連通
+        try:
+            t = await client.post(
+                "https://api.line.me/v2/bot/channel/webhook/test",
+                headers={**headers, "Content-Type": "application/json"},
+                json={"endpoint": webhook_url},
+            )
+            if t.status_code == 200:
+                result["webhook_active"] = bool(t.json().get("success"))
+            if not result["webhook_active"]:
+                result["warnings"].append("Webhook 測試未通過，請確認 LINE 後台「使用 webhook」已開啟")
+        except Exception:
+            pass
+
+    return result
+
+
+# ──────────────────────────────────────
 # LINE Webhook（升級版：防抖 + 靜音 + follow）
 # ──────────────────────────────────────
 
