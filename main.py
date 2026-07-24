@@ -2939,6 +2939,9 @@ async def get_profile(authorization: Optional[str] = Header(None)):
     except Exception:
         pass
 
+    admin_email = os.getenv("ADMIN_EMAIL", "")
+    is_admin = bool(admin_email) and email.lower() == admin_email.lower()
+
     return {
         "email":      email,
         "created_at": created_at,
@@ -2946,6 +2949,7 @@ async def get_profile(authorization: Optional[str] = Header(None)):
         "bot_slots":  slots,
         "bots_used":  bots_used,
         "renews_at":  renews_at,
+        "is_admin":   is_admin,
     }
 
 
