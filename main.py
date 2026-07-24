@@ -3254,6 +3254,17 @@ async def admin_delete_user(
     except Exception as e:
         logging.warning(f"[Admin Delete] memberships cleanup failed: {e}")
 
+    # 4.5) 刪 LINE 綁定資料（staff_line / line_binding_codes），避免留下孤兒綁定
+    #      讓管理助手仍把這支 LINE 認成已綁定的員工
+    try:
+        supabase.table("staff_line").delete().eq("app_user_id", app_user_id).execute()
+        line_uid = au.get("line_user_id")
+        if line_uid:
+            supabase.table("staff_line").delete().eq("line_user_id", line_uid).execute()
+        supabase.table("line_binding_codes").delete().eq("app_user_id", app_user_id).execute()
+    except Exception as e:
+        logging.warning(f"[Admin Delete] line binding cleanup failed: {e}")
+
     # 5) 刪 app_users 本身
     try:
         supabase.table("app_users").delete().eq("id", app_user_id).execute()
