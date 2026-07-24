@@ -23,6 +23,10 @@ JWT_SECRET = os.getenv("JWT_SECRET")
 if not JWT_SECRET:
     raise RuntimeError("JWT_SECRET 環境變數未設定，請在 Railway 加入此變數")
 
+# 平台管理的 Claude API Key（給後台設定助手「小懶」用；沒設就自動退回租客的 Gemini Key）
+PLATFORM_ANTHROPIC_KEY = os.getenv("PLATFORM_ANTHROPIC_KEY", "")
+ASSISTANT_CLAUDE_MODEL = os.getenv("ASSISTANT_CLAUDE_MODEL", "claude-sonnet-4-5")
+
 # 藍新金流 (NewebPay)
 NEWEBPAY_MERCHANT_ID = os.getenv("NEWEBPAY_MERCHANT_ID", "MS323238228")   # 換成你的商店代號
 NEWEBPAY_HASH_KEY    = os.getenv("NEWEBPAY_HASH_KEY",    "n_sdk_test_hash_key_1234")  # 換成你的 HashKey

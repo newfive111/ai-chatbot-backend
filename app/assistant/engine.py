@@ -1,7 +1,8 @@
 """
-Layer 2 AI 設定助手引擎
+Layer 2 AI 設定助手引擎「小懶」
 
-使用 Gemini 2.5 Pro + Function Calling 直接操作 Bot 設定。
+優先使用平台管理的 Claude（Anthropic）+ Tool Use；
+若平台未設 Claude Key，則自動退回租客自己的 Gemini + Function Calling。
 """
 
 import json
@@ -9,7 +10,10 @@ import logging
 from google import genai
 from google.genai import types
 
-from app.config import SUPABASE_URL, SUPABASE_KEY
+from app.config import (
+    SUPABASE_URL, SUPABASE_KEY,
+    PLATFORM_ANTHROPIC_KEY, ASSISTANT_CLAUDE_MODEL,
+)
 from supabase import create_client
 
 _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -154,6 +158,67 @@ _FUNCTION_DECLARATIONS = [
 ]
 
 
+# Anthropic Tool Use 版工具定義（與上面 Gemini 版一一對應，共用同一個 _execute_tool）
+_CLAUDE_TOOLS = [
+    {
+        "name": "get_bot_config",
+        "description": "取得目前 Bot 的所有設定，包含角色描述、收集欄位、歡迎訊息等。修改任何設定前必須先呼叫此工具，才能在現有內容基礎上做局部修改，而非從頭覆蓋。",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "replace_in_system_prompt",
+        "description": "在現有 system_prompt 中做精準字串替換。必須先呼叫 get_bot_config 取得原文，從中逐字複製要替換的舊文字，再提供新文字。後端直接做 string replace，其他內容完全不動。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "find": {"type": "string", "description": "要被替換的精確舊文字，必須與 get_bot_config 回傳的原文完全一致（逐字複製）"},
+                "replace": {"type": "string", "description": "替換後的新文字"},
+            },
+            "required": ["find", "replace"],
+        },
+    },
+    {
+        "name": "set_system_prompt",
+        "description": "從頭建立全新的 system_prompt。只有在 get_bot_config 確認原本 system_prompt 完全是空白時才使用，其他情況請用 replace_in_system_prompt。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "system_prompt": {"type": "string", "description": "完整的新系統提示詞"},
+            },
+            "required": ["system_prompt"],
+        },
+    },
+    {
+        "name": "update_collect_fields",
+        "description": "更新 Bot 需要收集的客戶資料欄位清單。用戶確認後才呼叫。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fields": {"type": "array", "items": {"type": "string"}, "description": "欄位名稱清單，例如 [\"姓名\", \"電話\", \"需求\"]"},
+                "sheet_id": {"type": "string", "description": "Google Sheet ID（選填，不改就不傳）"},
+            },
+            "required": ["fields"],
+        },
+    },
+    {
+        "name": "update_welcome",
+        "description": "更新 Bot 的歡迎訊息和快速回覆按鈕。用戶確認後才呼叫。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "welcome_message": {"type": "string", "description": "開場歡迎語，用戶進入聊天時自動顯示"},
+                "quick_replies": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"label": {"type": "string"}}},
+                    "description": "快速回覆按鈕清單，每個物件含 label 欄位",
+                },
+            },
+            "required": ["welcome_message", "quick_replies"],
+        },
+    },
+]
+
+
 def _save_snapshot(bot_id: str, source: str = "assistant") -> None:
     """更新前把目前設定存一份快照到 bot_settings_history"""
     try:
@@ -242,6 +307,92 @@ def _load_system_prompt() -> str:
 
 
 def run_assistant(bot_id: str, user_message: str, session_id: str, gemini_api_key: str) -> str:
+    """小懶進入點：優先用平台 Claude，沒設或失敗時退回租客 Gemini。"""
+    if PLATFORM_ANTHROPIC_KEY:
+        try:
+            return _run_assistant_claude(bot_id, user_message, session_id)
+        except Exception as e:
+            logging.error(f"[Assistant] Claude 失敗，嘗試退回 Gemini：{e}")
+            # 有 Gemini key 就退回，否則回報錯誤
+            if gemini_api_key:
+                return _run_assistant_gemini(bot_id, user_message, session_id, gemini_api_key)
+            return f"⚠️ AI 設定助手暫時無法連線，請稍後再試。（{str(e)[:60]}）"
+    return _run_assistant_gemini(bot_id, user_message, session_id, gemini_api_key)
+
+
+def _run_assistant_claude(bot_id: str, user_message: str, session_id: str) -> str:
+    """用平台管理的 Claude（Anthropic Tool Use）執行小懶。"""
+    import anthropic
+    client = anthropic.Anthropic(api_key=PLATFORM_ANTHROPIC_KEY)
+    system_prompt = _load_system_prompt()
+
+    from app.chat import session_store
+    session = session_store.get_or_create(session_id)
+    history: list = session.get("history", [])
+
+    # 只把純文字歷史帶入（不持久化中間的 tool_use 區塊，維持跨模型相容）
+    messages: list = []
+    for msg in history:
+        role = "assistant" if msg["role"] == "assistant" else "user"
+        messages.append({"role": role, "content": msg["content"]})
+    messages.append({"role": "user", "content": user_message})
+
+    for _iteration in range(6):
+        resp = None
+        last_err = None
+        for _attempt in range(3):
+            try:
+                resp = client.messages.create(
+                    model=ASSISTANT_CLAUDE_MODEL,
+                    max_tokens=2048,
+                    temperature=0.7,
+                    system=system_prompt,
+                    tools=_CLAUDE_TOOLS,
+                    messages=messages,
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                es = str(e).lower()
+                if "overloaded" in es or "529" in es or "rate" in es or "503" in es:
+                    import time; time.sleep(3 * (_attempt + 1))
+                else:
+                    break
+        if last_err is not None:
+            raise last_err
+
+        # 把 assistant 這輪的完整回覆（含 tool_use 區塊）加回對話
+        messages.append({"role": "assistant", "content": resp.content})
+        tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
+
+        if resp.stop_reason == "tool_use" and tool_uses:
+            tool_results = []
+            for tu in tool_uses:
+                args = dict(tu.input) if tu.input else {}
+                result = _execute_tool(tu.name, args, bot_id, session)
+                logging.info(f"[Assistant/Claude] Tool: {tu.name}({list(args.keys())}) → {result[:80]}")
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": result,
+                })
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            final_text = "".join(
+                b.text for b in resp.content if getattr(b, "type", None) == "text"
+            ).strip() or "處理完成，請確認設定是否正確。"
+            history.append({"role": "user", "content": user_message})
+            history.append({"role": "assistant", "content": final_text})
+            session["history"] = history
+            session_store.save(session_id, session)
+            logging.info(f"[Assistant/Claude] Done in {_iteration + 1} iterations for bot {bot_id[:8]}")
+            return final_text
+
+    return "⚠️ 處理超時，請重新描述你的需求。"
+
+
+def _run_assistant_gemini(bot_id: str, user_message: str, session_id: str, gemini_api_key: str) -> str:
     """
     執行 AI 助手對話（含 Function Calling 迴圈）
     回傳助手的最終文字回覆
