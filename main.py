@@ -357,9 +357,13 @@ _INVITE_TTL_DAYS = 7
 @app.get("/orgs")
 async def list_my_orgs(authorization: Optional[str] = Header(None)):
     app_user = get_app_user(authorization)
-    org_ids = get_user_org_ids(app_user["id"])
-    if not org_ids:
+    # 一次撈出所有 membership（含 role），省掉每個團隊各查一次角色的 N+1
+    memberships = supabase.table("memberships").select("org_id, role") \
+        .eq("user_id", app_user["id"]).execute().data or []
+    if not memberships:
         return []
+    role_by_org = {m["org_id"]: m["role"] for m in memberships}
+    org_ids = list(role_by_org.keys())
     rows = supabase.table("organizations").select("id, name, owner_id").in_("id", org_ids).execute()
     result = []
     for o in (rows.data or []):
@@ -367,7 +371,7 @@ async def list_my_orgs(authorization: Optional[str] = Header(None)):
             "id": o["id"],
             "name": o["name"],
             "is_owner": o["owner_id"] == app_user["id"],
-            "role": get_membership_role(o["id"], app_user["id"]),
+            "role": role_by_org.get(o["id"]),
         })
     return result
 
