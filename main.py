@@ -2865,7 +2865,7 @@ def _admin_collect_users() -> list:
     # app_users：我們自己維護的使用者表（含 email / supabase_uid / 顯示名稱）
     try:
         au_rows = supabase.table("app_users").select(
-            "id, email, supabase_uid, display_name, created_at"
+            "id, email, supabase_uid, display_name, created_at, admin_note"
         ).execute().data or []
     except Exception as e:
         logging.warning(f"[Admin] app_users query failed: {e}")
@@ -2911,6 +2911,7 @@ def _admin_collect_users() -> list:
             "max_bots":   1 + slots,
             "bots_used":  bot_count.get(suid, 0) if suid else 0,
             "renews_at":  renews_map.get(suid) if suid else None,
+            "admin_note": u.get("admin_note") or "",
         })
 
     result.sort(key=lambda x: x["created_at"], reverse=True)
@@ -3048,6 +3049,124 @@ async def admin_extend_subscription(
     except Exception as e:
         raise HTTPException(500, f"DB 寫入失敗：{str(e)}")
     return {"ok": True, "user_id": target_user_id, "renews_at": new_renews}
+
+
+class AdminNoteUpdate(BaseModel):
+    note: str = ""
+
+
+def _find_app_user_by_target(target_user_id: str) -> Optional[dict]:
+    """後台清單的 user_id 優先是 supabase uid，找不到再退回 app_users.id。"""
+    try:
+        r = supabase.table("app_users").select("*").eq("supabase_uid", target_user_id).execute()
+        if r.data:
+            return r.data[0]
+    except Exception:
+        pass
+    try:
+        r = supabase.table("app_users").select("*").eq("id", target_user_id).execute()
+        if r.data:
+            return r.data[0]
+    except Exception:
+        pass
+    return None
+
+
+@app.post("/admin/users/{target_user_id}/note")
+async def admin_set_note(
+    target_user_id: str,
+    body: AdminNoteUpdate,
+    authorization: Optional[str] = Header(None),
+):
+    """幫某位使用者加/改備注，只存在 app_users.admin_note，純內部用。"""
+    require_admin(authorization)
+    au = _find_app_user_by_target(target_user_id)
+    if not au:
+        raise HTTPException(404, "找不到這位使用者")
+    note = (body.note or "")[:500]
+    try:
+        supabase.table("app_users").update({"admin_note": note}).eq("id", au["id"]).execute()
+    except Exception as e:
+        raise HTTPException(500, f"DB 寫入失敗：{str(e)}")
+    return {"ok": True, "user_id": target_user_id, "note": note}
+
+
+@app.delete("/admin/users/{target_user_id}")
+async def admin_delete_user(
+    target_user_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    """徹底刪除一位使用者（清測試帳號用）。連帶刪除：他開的 bots（含 knowledge_chunks、
+    conversations）、bot_subscriptions、memberships、他擁有的 organizations（含底下 memberships、
+    invites），最後刪 app_users 與 Supabase auth 帳號。防呆：不能刪自己 / 管理員帳號。"""
+    admin_uid = require_admin(authorization)
+
+    au = _find_app_user_by_target(target_user_id)
+    if not au:
+        raise HTTPException(404, "找不到這位使用者")
+
+    suid = au.get("supabase_uid")
+    app_user_id = au["id"]
+
+    # 防呆：不能刪自己，也不能刪管理員帳號
+    if suid and suid == admin_uid:
+        raise HTTPException(400, "不能刪除自己")
+    if (au.get("email") or "").lower() == (ADMIN_EMAIL or "").lower():
+        raise HTTPException(400, "不能刪除管理員帳號")
+
+    deleted = {"bots": 0, "orgs": 0}
+
+    # 1) 刪他開的 bots（bots.user_id = supabase uid），連同知識庫/對話
+    if suid:
+        try:
+            bots = supabase.table("bots").select("id").eq("user_id", suid).execute().data or []
+            for b in bots:
+                bid = b["id"]
+                supabase.table("knowledge_chunks").delete().eq("bot_id", bid).execute()
+                supabase.table("conversations").delete().eq("bot_id", bid).execute()
+                supabase.table("bots").delete().eq("id", bid).execute()
+                deleted["bots"] += 1
+        except Exception as e:
+            logging.warning(f"[Admin Delete] bots cleanup failed: {e}")
+
+        # 2) 刪訂閱（含手動 admin_ 前綴那筆）
+        try:
+            supabase.table("bot_subscriptions").delete().eq("user_id", suid).execute()
+        except Exception as e:
+            logging.warning(f"[Admin Delete] subscriptions cleanup failed: {e}")
+
+    # 3) 刪他擁有的團隊（organizations.owner_id = app_user.id），連同底下 memberships / invites
+    try:
+        orgs = supabase.table("organizations").select("id").eq("owner_id", app_user_id).execute().data or []
+        for o in orgs:
+            oid = o["id"]
+            supabase.table("memberships").delete().eq("org_id", oid).execute()
+            supabase.table("invites").delete().eq("org_id", oid).execute()
+            supabase.table("organizations").delete().eq("id", oid).execute()
+            deleted["orgs"] += 1
+    except Exception as e:
+        logging.warning(f"[Admin Delete] orgs cleanup failed: {e}")
+
+    # 4) 刪他在別人團隊裡的 membership
+    try:
+        supabase.table("memberships").delete().eq("user_id", app_user_id).execute()
+    except Exception as e:
+        logging.warning(f"[Admin Delete] memberships cleanup failed: {e}")
+
+    # 5) 刪 app_users 本身
+    try:
+        supabase.table("app_users").delete().eq("id", app_user_id).execute()
+    except Exception as e:
+        raise HTTPException(500, f"刪除 app_user 失敗：{str(e)}")
+
+    # 6) 刪 Supabase auth 帳號（有 supabase uid 才有）
+    if suid:
+        try:
+            _admin.auth.admin.delete_user(suid)
+        except Exception as e:
+            logging.warning(f"[Admin Delete] auth delete failed for {suid[:8]}: {e}")
+
+    return {"ok": True, "deleted_user": target_user_id, **deleted}
 
 
 # ──────────────────────────────────────
