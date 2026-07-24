@@ -33,6 +33,7 @@ _admin = create_client(SUPABASE_URL, SUPABASE_KEY)
 @app.on_event("startup")
 async def _startup():
     load_muted_users()
+    asyncio.create_task(_expiry_scheduler_loop())
 
 
 @app.get("/health")
@@ -517,15 +518,34 @@ def get_user_id(authorization: str = None) -> str:
     payload = decode_token(token)
     return payload["user_id"]
 
+def _sub_is_valid(sub: dict) -> bool:
+    """訂閱是否有效：status=active 且（沒設到期日 或 到期日還沒過）。
+    renews_at 為空 → 視為永久有效（保護沒設到期日的舊訂閱，不誤殺）。"""
+    if sub.get("status") != "active":
+        return False
+    renews_at = sub.get("renews_at")
+    if not renews_at:
+        return True
+    try:
+        exp = datetime.fromisoformat(str(renews_at).replace("Z", "+00:00"))
+        if exp.tzinfo:
+            exp = exp.replace(tzinfo=None)
+        return datetime.utcnow() <= exp
+    except Exception:
+        # 日期格式怪 → 保守當作有效，避免誤停用
+        return True
+
+
 def get_bot_slots(user_id: str) -> int:
-    """回傳該用戶目前有效的付費 Bot 名額總數（商業版=10, 單Bot=1）"""
+    """回傳該用戶目前有效的付費 Bot 名額總數（商業版=10, 單Bot=1）。
+    已過期（renews_at 已過）的訂閱不計入 → 到期自動停用。"""
     try:
         rows = supabase.table("bot_subscriptions") \
-            .select("slots") \
+            .select("slots, status, renews_at") \
             .eq("user_id", user_id) \
             .eq("status", "active") \
             .execute()
-        return sum(r.get("slots", 1) for r in (rows.data or []))
+        return sum(r.get("slots", 1) for r in (rows.data or []) if _sub_is_valid(r))
     except Exception:
         return 0
 
@@ -3072,3 +3092,129 @@ async def admin_set_slots(
     except Exception as e:
         raise HTTPException(500, f"DB 寫入失敗：{str(e)}")
     return {"ok": True, "user_id": target_user_id, "slots": body.slots}
+
+
+class AdminExtendRequest(BaseModel):
+    days: int = 30
+    slots: int = 1  # 若目前沒有任何有效名額，開通時給幾個名額
+
+
+@app.post("/admin/users/{target_user_id}/extend")
+async def admin_extend_subscription(
+    target_user_id: str,
+    body: AdminExtendRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """手動幫租客延長訂閱 N 天（收到轉帳後用）。從現有到期日往後加，
+    到期日已過或沒有則從今天算起。同時清空 warned_at 讓下一輪能再提醒。"""
+    require_admin(authorization)
+    days = max(1, min(body.days, 3650))
+    sub_id = f"admin_{target_user_id}"
+    now = datetime.utcnow()
+
+    # 找現有的手動訂閱，取其到期日當基準
+    base = now
+    try:
+        existing = supabase.table("bot_subscriptions").select("renews_at, slots").eq("id", sub_id).execute()
+        cur_slots = body.slots
+        if existing.data:
+            cur_slots = existing.data[0].get("slots") or body.slots
+            cur_renews = existing.data[0].get("renews_at")
+            if cur_renews:
+                try:
+                    exp = datetime.fromisoformat(str(cur_renews).replace("Z", "+00:00"))
+                    if exp.tzinfo:
+                        exp = exp.replace(tzinfo=None)
+                    if exp > now:
+                        base = exp  # 還沒過期 → 從現有到期日往後疊加
+                except Exception:
+                    pass
+        new_renews = (base + timedelta(days=days)).isoformat()
+        supabase.table("bot_subscriptions").upsert({
+            "id":         sub_id,
+            "user_id":    target_user_id,
+            "status":     "active",
+            "slots":      max(1, cur_slots),
+            "renews_at":  new_renews,
+            "warned_at":  None,
+        }, on_conflict="id").execute()
+    except Exception as e:
+        raise HTTPException(500, f"DB 寫入失敗：{str(e)}")
+    return {"ok": True, "user_id": target_user_id, "renews_at": new_renews}
+
+
+# ──────────────────────────────────────
+# 訂閱到期提醒排程（到期前 7 天用管理助手推 LINE）
+# ──────────────────────────────────────
+
+def _resolve_tenant_line_id(supabase_uid: str) -> Optional[str]:
+    """由訂閱的 user_id(supabase uid) 找出可用管理助手推播的 LINE userId。
+    優先用 staff_line（確定綁過管理助手），其次 app_users.line_user_id。"""
+    try:
+        au = supabase.table("app_users").select("id, line_user_id").eq("supabase_uid", supabase_uid).execute()
+        if not au.data:
+            return None
+        app_user_id = au.data[0]["id"]
+        sl = supabase.table("staff_line").select("line_user_id").eq("app_user_id", app_user_id).execute()
+        if sl.data and sl.data[0].get("line_user_id"):
+            return sl.data[0]["line_user_id"]
+        return au.data[0].get("line_user_id")
+    except Exception:
+        return None
+
+
+async def _expiry_warning_tick():
+    """掃描 7 天內到期、還沒提醒過的手動訂閱，用管理助手推 LINE 提醒。"""
+    if not ADMIN_LINE_CHANNEL_ACCESS_TOKEN:
+        return
+    now = datetime.utcnow()
+    try:
+        rows = supabase.table("bot_subscriptions").select(
+            "id, user_id, renews_at, warned_at, status"
+        ).eq("status", "active").execute()
+    except Exception as e:
+        logging.warning(f"[Expiry] query failed: {e}")
+        return
+
+    for sub in (rows.data or []):
+        renews_at = sub.get("renews_at")
+        if not renews_at or sub.get("warned_at"):
+            continue
+        try:
+            exp = datetime.fromisoformat(str(renews_at).replace("Z", "+00:00"))
+            if exp.tzinfo:
+                exp = exp.replace(tzinfo=None)
+        except Exception:
+            continue
+        days_left = (exp - now).days
+        # 只在「未過期」且「剩 7 天內」時提醒（過期就靠付費牆停用，不再提醒）
+        if not (0 <= days_left <= 7):
+            continue
+        line_id = _resolve_tenant_line_id(sub["user_id"])
+        if not line_id:
+            continue
+        msg = (
+            f"⏰ 訂閱即將到期提醒\n\n"
+            f"您的「懶得回」AI 客服服務將於 {exp.strftime('%Y/%m/%d')} 到期"
+            f"（剩 {days_left} 天）。\n\n"
+            f"到期後 Bot 將暫停自動回覆，請記得續約以免影響客戶服務 🙏"
+        )
+        try:
+            code = await _admin_push(line_id, [_admin_text_msg(msg)])
+            if code == 200:
+                supabase.table("bot_subscriptions").update(
+                    {"warned_at": now.isoformat()}
+                ).eq("id", sub["id"]).execute()
+                logging.info(f"[Expiry] warned user={sub['user_id'][:8]} days_left={days_left}")
+        except Exception as e:
+            logging.warning(f"[Expiry] push failed for {sub['id']}: {e}")
+
+
+async def _expiry_scheduler_loop():
+    """每小時檢查一次訂閱到期。"""
+    while True:
+        try:
+            await _expiry_warning_tick()
+        except Exception as e:
+            logging.warning(f"[Expiry] tick error: {e}")
+        await asyncio.sleep(3600)
