@@ -1622,6 +1622,16 @@ def _try_bind_staff(line_user_id: str, text: str) -> Optional[dict]:
         on_conflict="line_user_id",
     ).execute()
     supabase.table("line_binding_codes").delete().eq("code", code).execute()
+    # 同步 LINE 身分到主帳號：讓之後「LINE 登入」能認出同一人、不再開分身帳號
+    # （6 碼綁定與自動綁定兩條路結果一致）
+    try:
+        others = supabase.table("app_users").select("id") \
+            .eq("line_user_id", line_user_id).neq("id", app_user_id).execute().data or []
+        for o in others:
+            supabase.table("app_users").update({"line_user_id": None}).eq("id", o["id"]).execute()
+        supabase.table("app_users").update({"line_user_id": line_user_id}).eq("id", app_user_id).execute()
+    except Exception as e:
+        logging.warning(f"[bind] sync line_user_id to app_user failed: {e}")
     au = supabase.table("app_users").select("*").eq("id", app_user_id).execute()
     return au.data[0] if au.data else None
 
