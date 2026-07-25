@@ -1430,13 +1430,21 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
             logging.info(f"[LINE] Sticker skip for {user_id}")
             return
 
-        # 優先用 push（不依賴 replyToken 過期），失敗才 fallback
-        push_ok = await push_line_message(user_id, answer, access_token=line_token, quick_replies=quick_replies)
-        if push_ok != 200:
-            reply_token = buf.get("reply_token", "")
-            if reply_token:
-                await reply_line_message(reply_token, answer, access_token=line_token, quick_replies=quick_replies)
-                logging.info(f"[LINE] Fallback to replyToken for {user_id}")
+        # 優先用「回覆 token」（免費、不吃推播月額度）；失敗或過期才退回 push。
+        # 客戶剛傳訊息、debounce 幾秒後就回，reply token 通常仍有效，可大幅節省推播額度。
+        sent = False
+        reply_token = buf.get("reply_token", "")
+        if reply_token:
+            reply_status = await reply_line_message(
+                reply_token, answer, access_token=line_token, quick_replies=quick_replies)
+            if reply_status == 200:
+                sent = True
+            else:
+                logging.info(f"[LINE] reply token failed ({reply_status}) for {user_id}, fallback to push")
+        if not sent:
+            push_ok = await push_line_message(user_id, answer, access_token=line_token, quick_replies=quick_replies)
+            if push_ok != 200:
+                logging.warning(f"[LINE] push also failed ({push_ok}) for {user_id}")
 
         # 記錄對話到 DB（供 AI 分析使用）
         try:

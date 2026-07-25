@@ -52,19 +52,20 @@ async def download_line_content(message_id: str, access_token: str = None) -> tu
         return resp.content, mime
 
 
-async def reply_line_message(reply_token: str, text: str, access_token: str = None, quick_replies: list = None):
-    """回覆訊息（reply token，只能用一次）"""
+async def reply_line_message(reply_token: str, text: str, access_token: str = None, quick_replies: list = None) -> int:
+    """回覆訊息（reply token，只能用一次；免費、不計入推播額度）。回傳 HTTP 狀態碼。"""
     token = access_token or LINE_CHANNEL_ACCESS_TOKEN
     msg: dict = {"type": "text", "text": text}
     qr = _build_quick_reply(quick_replies)
     if qr:
         msg["quickReply"] = qr
     async with httpx.AsyncClient() as client:
-        await client.post(
+        resp = await client.post(
             "https://api.line.me/v2/bot/message/reply",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json={"replyToken": reply_token, "messages": [msg]}
         )
+        return resp.status_code
 
 
 async def push_line_message(user_id: str, text: str, access_token: str = None, quick_replies: list = None) -> int:
