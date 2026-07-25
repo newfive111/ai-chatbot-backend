@@ -2059,8 +2059,14 @@ async def _handle_admin_event(event: dict):
             await _admin_reply(reply_token, msgs)
             return
 
+        if text in ["摘要", "統計", "今日", "報表"]:
+            summary = _build_daily_summary_for_user(staff)
+            await _admin_reply(reply_token, [_admin_text_msg(
+                summary or "今天目前還沒有任何對話。", _menu_quick_items())])
+            return
+
         await _admin_reply(reply_token, [_admin_text_msg(
-            "指令：\n・輸入「清單」查看可接手的對話\n・在對話卡片按「接手／恢復 AI／代回」操作",
+            "指令：\n・輸入「清單」查看可接手的對話\n・輸入「摘要」查看今日營運統計\n・在對話卡片按「接手／恢復 AI／代回」操作",
             _menu_quick_items())])
         return
 
@@ -3510,6 +3516,38 @@ async def _expiry_warning_tick():
 
 
 _daily_summary_date: Optional[str] = None  # 已發送摘要的台北日期 YYYY-MM-DD
+
+
+def _build_daily_summary_for_user(app_user: dict) -> Optional[str]:
+    """算某位使用者所屬團隊今日（台北）的營運摘要文字；沒對話回 None。"""
+    tpe = datetime.utcnow() + timedelta(hours=8)
+    today = tpe.strftime("%Y-%m-%d")
+    start_utc = (datetime.strptime(today, "%Y-%m-%d") - timedelta(hours=8)).isoformat()
+    org_ids = get_user_org_ids(app_user["id"])
+    if not org_ids:
+        return None
+    try:
+        bots = supabase.table("bots").select("id").in_("org_id", org_ids).execute().data or []
+        bot_ids = [b["id"] for b in bots]
+        if not bot_ids:
+            return None
+        rows = supabase.table("conversations").select("session_id, question") \
+            .in_("bot_id", bot_ids).gte("created_at", start_utc).execute().data or []
+    except Exception as e:
+        logging.warning(f"[Summary] manual stats failed: {e}")
+        return None
+    total = len(rows)
+    if total == 0:
+        return None
+    customers = len({r.get("session_id") for r in rows if r.get("session_id")})
+    handoffs = sum(1 for r in rows if "代回" in (r.get("question") or ""))
+    return (
+        f"📊 今日營運摘要（{today}）\n\n"
+        f"👥 客戶數：{customers} 位\n"
+        f"💬 對話則數：{total} 則\n"
+        f"🙋 真人代回：{handoffs} 則\n\n"
+        f"辛苦了，明天繼續加油 💪"
+    )
 
 
 async def _daily_summary_tick():
