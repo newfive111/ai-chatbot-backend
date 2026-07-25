@@ -2890,14 +2890,16 @@ async def list_conversation_sessions(
 ):
     """列出 bot 的對話 session（給「查看對話紀錄」用），依 session_id 分組回傳。"""
     require_bot_access(bot_id, authorization, min_role="viewer")
+    # 取「最新」的訊息：先 desc 抓最近 1000 筆，之後每個 session 內再改回時間正序顯示。
+    # （若用 asc + limit 會拿到最舊的資料、把最新的回覆截掉）
     query = supabase.table("conversations")\
         .select("question, answer, session_id, created_at")\
         .eq("bot_id", bot_id)\
-        .order("created_at", desc=False)
+        .order("created_at", desc=True)
     if days > 0:
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()
         query = query.gte("created_at", since)
-    rows = query.limit(500).execute()
+    rows = query.limit(1000).execute()
     convs = rows.data or []
 
     from collections import OrderedDict
@@ -2907,6 +2909,9 @@ async def list_conversation_sessions(
         if sid not in sessions:
             sessions[sid] = []
         sessions[sid].append(c)
+    # 每個 session 內改回時間正序（由舊到新），讓對話讀起來順、first/last_at 正確
+    for sid in sessions:
+        sessions[sid].sort(key=lambda m: m.get("created_at") or "")
 
     out = []
     for sid, msgs in sessions.items():
