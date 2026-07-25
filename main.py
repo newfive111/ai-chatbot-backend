@@ -2864,9 +2864,24 @@ async def reply_chat(
     token = _get_bot_config(bot_id).get("line_channel_access_token")
     if not token:
         raise HTTPException(400, "此 Bot 尚未設定 LINE，無法代回")
-    status = await push_line_message(line_user_id, text, access_token=token)
-    if status != 200:
-        raise HTTPException(502, f"傳送失敗（{status}），請稍後再試")
+
+    # 直接呼叫 LINE push，並把錯誤原因帶回前端（方便診斷：配額用盡、token 失效、非好友等）
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"to": line_user_id, "messages": [{"type": "text", "text": text}]},
+            timeout=15,
+        )
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get("message", "")
+        except Exception:
+            detail = (resp.text or "")[:200]
+        logging.warning(f"[reply] push failed {resp.status_code} to {line_user_id[:8]}…: {detail}")
+        raise HTTPException(502, f"LINE 傳送失敗（{resp.status_code}）：{detail or '請稍後再試'}")
+    logging.info(f"[reply] pushed ok to {line_user_id[:8]}… by {access['app_user'].get('email','')}")
 
     add_mute(bot_id, line_user_id, muted_by=access["app_user"]["id"])
     staff_name = access["app_user"].get("display_name") or access["app_user"].get("email") or ""
