@@ -38,6 +38,20 @@ def _build_quick_reply(quick_replies: list) -> dict | None:
     return {"items": items} if items else None
 
 
+async def download_line_content(message_id: str, access_token: str = None) -> tuple[bytes, str]:
+    """下載 LINE 訊息的多媒體內容（圖片/影音）。回傳 (bytes, mime_type)。"""
+    token = access_token or LINE_CHANNEL_ACCESS_TOKEN
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://api-data.line.me/v2/bot/message/{message_id}/content",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        mime = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+        return resp.content, mime
+
+
 async def reply_line_message(reply_token: str, text: str, access_token: str = None, quick_replies: list = None):
     """回覆訊息（reply token，只能用一次）"""
     token = access_token or LINE_CHANNEL_ACCESS_TOKEN

@@ -15,7 +15,7 @@ import httpx
 from app.rag.processor import extract_text_from_pdf, chunk_text
 from app.rag.embeddings import store_chunks, search_similar_chunks
 from app.chat.engine import generate_answer, reset_session
-from app.line.webhook import verify_line_signature, reply_line_message, push_line_message
+from app.line.webhook import verify_line_signature, reply_line_message, push_line_message, download_line_content
 from app.auth.utils import create_token, decode_token, generate_bot_id
 from app.config import (
     SUPABASE_URL, SUPABASE_KEY,
@@ -1445,12 +1445,32 @@ async def line_webhook(bot_id: str, request: Request):
                 await reply_line_message(reply_token, welcome, access_token=line_token, quick_replies=bot.get("quick_replies") or None)
             continue
 
-        # ── 只處理文字訊息 ──
-        if event["type"] != "message" or event["message"]["type"] != "text":
+        # ── 只處理 message 事件 ──
+        if event["type"] != "message":
+            continue
+
+        msg_type = event["message"].get("type")
+        reply_token = event["replyToken"]
+
+        # ── 圖片訊息：非同步下載 + Gemini 讀圖，轉成文字後走一般流程 ──
+        if msg_type == "image":
+            if buf_key in _muted_line_users:
+                continue
+            asyncio.create_task(_ingest_line_image(
+                bot, bot_id, user_id, buf_key, event["message"]["id"], reply_token, line_token))
+            continue
+
+        # ── 貼圖 / 其他非文字：不進 AI，回一句提示引導改打字 ──
+        if msg_type != "text":
+            if buf_key in _muted_line_users:
+                continue
+            await reply_line_message(
+                reply_token,
+                "我這邊收到您的訊息了 😊 但貼圖或這類訊息我看不懂內容，麻煩您用文字告訴我需要什麼，或直接傳圖片給我看喔！",
+                access_token=line_token, quick_replies=bot.get("quick_replies") or None)
             continue
 
         user_msg = event["message"]["text"]
-        reply_token = event["replyToken"]
 
         # ── 用戶自助重置 ──
         if user_msg.strip() in ["/reset", "重來", "重置", "重新開始"]:
@@ -1475,29 +1495,53 @@ async def line_webhook(bot_id: str, request: Request):
         # ── 關鍵字警示（主動通知 owner/admin，非阻塞）──
         asyncio.create_task(_fire_keyword_alert(bot_id, user_id, user_msg))
 
-        # ── 防抖緩衝（15 秒）──
-        if buf_key in _line_buffers:
-            # 取消舊計時器，累積訊息
-            old_task = _line_buffers[buf_key].get("task")
-            if old_task and not old_task.done():
-                old_task.cancel()
-            _line_buffers[buf_key]["msgs"].append(user_msg)
-            _line_buffers[buf_key]["reply_token"] = reply_token  # 永遠用最新的 replyToken
-        else:
-            _line_buffers[buf_key] = {
-                "msgs": [user_msg],
-                "reply_token": reply_token,
-                "task": None
-            }
-
-        # 啟動新計時器
-        bot_debounce = bot.get("debounce_seconds") or 15
-        task = asyncio.create_task(_process_line_buffer(bot_id, user_id, buf_key, bot_debounce))
-        _line_buffers[buf_key]["task"] = task
-        logging.info(f"[LINE] Buffered msg from {user_id}: '{user_msg}' ({bot_debounce}s timer)")
+        _enqueue_line_text(bot, bot_id, user_id, buf_key, user_msg, reply_token)
 
     # 立即回 200 給 LINE Server，避免 timeout
     return {"status": "ok"}
+
+
+def _enqueue_line_text(bot: dict, bot_id: str, user_id: str, buf_key: str,
+                       user_msg: str, reply_token: str):
+    """把一則文字塞進防抖緩衝並（重新）啟動計時器。文字與圖片辨識結果共用。"""
+    if buf_key in _line_buffers:
+        old_task = _line_buffers[buf_key].get("task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        _line_buffers[buf_key]["msgs"].append(user_msg)
+        _line_buffers[buf_key]["reply_token"] = reply_token
+    else:
+        _line_buffers[buf_key] = {"msgs": [user_msg], "reply_token": reply_token, "task": None}
+
+    bot_debounce = bot.get("debounce_seconds") or 15
+    task = asyncio.create_task(_process_line_buffer(bot_id, user_id, buf_key, bot_debounce))
+    _line_buffers[buf_key]["task"] = task
+    logging.info(f"[LINE] Buffered msg from {user_id}: '{user_msg[:40]}' ({bot_debounce}s timer)")
+
+
+async def _ingest_line_image(bot: dict, bot_id: str, user_id: str, buf_key: str,
+                             message_id: str, reply_token: str, line_token: str):
+    """下載 LINE 圖片 → Gemini 讀圖 → 把辨識內容當文字塞進一般流程。失敗則提示客戶。"""
+    api_key = bot.get("anthropic_api_key")
+    if not api_key:
+        return
+    try:
+        img_bytes, mime = await download_line_content(message_id, access_token=line_token)
+    except Exception as e:
+        logging.warning(f"[Vision] download failed {message_id}: {e}")
+        await push_line_message(user_id, "圖片我這邊沒收到，可以麻煩您再傳一次，或直接用打字的嗎？🙏",
+                                access_token=line_token)
+        return
+
+    from app.chat.engine import describe_image
+    desc = await asyncio.to_thread(describe_image, api_key, img_bytes, mime)
+    if not desc:
+        await push_line_message(user_id, "這張圖片我看不太清楚內容，可以麻煩您用文字說明，或換一張清楚一點的嗎？🙏",
+                                access_token=line_token)
+        return
+
+    text = f"（客戶傳了一張圖片，圖片內容如下）\n{desc}"
+    _enqueue_line_text(bot, bot_id, user_id, buf_key, text, reply_token)
 
 
 # ──────────────────────────────────────

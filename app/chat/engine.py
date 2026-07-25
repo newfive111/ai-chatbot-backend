@@ -213,6 +213,47 @@ def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> 
     raise last_err
 
 
+def describe_image(api_key: str, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+    """用 Gemini 2.5 Flash 讀圖：輸出圖片內容描述 + 完整 OCR 文字。失敗回空字串。"""
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    prompt = (
+        "請用繁體中文描述這張圖片的內容。"
+        "若圖片中有任何文字（例如證件、單據、螢幕截圖、表格），請完整、逐字列出所有文字，不要遺漏數字。"
+        "只描述你實際看到的內容，看不清楚的地方就說看不清楚，不要臆測。"
+    )
+    import time as _time
+    last_err = None
+    for _attempt in range(2):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Content(role="user", parts=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        types.Part(text=prompt),
+                    ])
+                ],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=1024,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            parts = response.candidates[0].content.parts if response.candidates else []
+            text = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
+            return (text or response.text or "").strip()
+        except Exception as e:
+            last_err = e
+            if "503" in str(e) or "overloaded" in str(e).lower():
+                _time.sleep(2 * (_attempt + 1))
+            else:
+                break
+    logging.warning(f"[Vision] describe_image failed: {last_err}")
+    return ""
+
+
 def _call_ai_with_calendar(
     api_key: str,
     system_prompt: str,
