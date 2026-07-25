@@ -986,6 +986,8 @@ class UpdateBotRequest(BaseModel):
     debounce_seconds: Optional[int] = None
     # 下班時間
     off_hours_message: Optional[str] = None
+    # 觀察模式：開啟時 AI 不回覆，只記錄客戶訊息並通知員工代回
+    observe_mode: Optional[bool] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -1325,7 +1327,7 @@ def _get_bot_config(bot_id: str) -> dict:
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, quick_replies, "
         "line_channel_secret, line_channel_access_token, "
         "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds, "
-        "instagram_page_token, instagram_account_id, facebook_page_id, off_hours_message"
+        "instagram_page_token, instagram_account_id, facebook_page_id, off_hours_message, observe_mode"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
@@ -1362,6 +1364,23 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
         business_hours = bot.get("business_hours") or None
         keyword_triggers  = bot.get("keyword_triggers") or None
         off_hours_message = bot.get("off_hours_message") or None
+
+        # ── 觀察模式 / 已被真人接手：AI 不回覆，只記錄客戶訊息並轉達給員工 ──
+        observe_mode = bool(bot.get("observe_mode"))
+        muted = _mute_key(bot_id, user_id) in _muted_line_users
+        if observe_mode or muted:
+            try:
+                supabase.table("conversations").insert({
+                    "bot_id": bot_id,
+                    "question": combined_msg,
+                    "answer": "",
+                    "session_id": session_id,
+                }).execute()
+            except Exception as _e:
+                logging.warning(f"[LINE] passive log failed: {_e}")
+            await _relay_customer_msg(bot_id, user_id, combined_msg, observe_mode=observe_mode)
+            logging.info(f"[LINE] Passive (observe={observe_mode}, muted={muted}) for {user_id}")
+            return
 
         # 抓 LINE 暱稱：填入記憶體快取（對話清單顯示用）＋存入試算表方便對應聊天室
         line_display_name = await fetch_line_display_name(bot_id, user_id, line_token)
@@ -1472,24 +1491,26 @@ async def line_webhook(bot_id: str, request: Request):
         msg_type = event["message"].get("type")
         reply_token = event["replyToken"]
 
+        # 觀察模式 / 已被真人接手：一律不讓 AI 回覆（訊息仍會被記錄＋轉達員工）
+        _passive = bool(bot.get("observe_mode")) or (buf_key in _muted_line_users)
+
         # ── 圖片訊息：非同步下載 + Gemini 讀圖，轉成文字後走一般流程 ──
+        # （被動狀態下仍讀圖，讓員工能看到客戶傳的圖片內容）
         if msg_type == "image":
-            if buf_key in _muted_line_users:
-                continue
             asyncio.create_task(_ingest_line_image(
                 bot, bot_id, user_id, buf_key, event["message"]["id"], reply_token, line_token))
             continue
 
         # ── 貼圖：交給 AI 依上下文判斷（沒答的題目再問一次，已答過就略過不回）──
         if msg_type == "sticker":
-            if buf_key in _muted_line_users:
+            if _passive:
                 continue
             _enqueue_line_text(bot, bot_id, user_id, buf_key, _STICKER_EVENT_MSG, reply_token)
             continue
 
         # ── 其他非文字（語音/影片/位置/檔案）：回一句提示引導改打字 ──
         if msg_type != "text":
-            if buf_key in _muted_line_users:
+            if _passive:
                 continue
             await reply_line_message(
                 reply_token,
@@ -1508,10 +1529,8 @@ async def line_webhook(bot_id: str, request: Request):
             await reply_line_message(reply_token, welcome, access_token=line_token, quick_replies=bot.get("quick_replies") or None)
             continue
 
-        # ── 靜音檢查（已交接，不再 AI 回應）──
-        if buf_key in _muted_line_users:
-            logging.info(f"[LINE] Muted user {user_id}, ignoring message")
-            continue
+        # 注意：靜音／觀察模式的訊息不在此攔截，改由 _process_line_buffer
+        # 記錄並轉達給員工（讓真人代回時仍能即時看到客戶新訊息）。
 
         # ── 垃圾訊息過濾 ──
         if any(kw in user_msg for kw in _SPAM_KEYWORDS) and len(user_msg) > 30:
@@ -1577,12 +1596,69 @@ async def _ingest_line_image(bot: dict, bot_id: str, user_id: str, buf_key: str,
 
 import urllib.parse as _urlparse
 
-# 員工在管理 bot 按「代回」後，暫存等待輸入回覆內容的目標
-# key = 管理 bot 的 line userId -> {"bot_id":..., "uid":..., "name":...}
-_admin_pending_reply: Dict[str, dict] = {}
+# 員工正在「連續代回」某位客戶：之後輸入的每則文字都直接轉給該客戶，
+# 直到輸入「結束」離開。key = 管理 bot 的 line userId -> {"bot_id":..., "uid":..., "name":...}
+_admin_active_chat: Dict[str, dict] = {}
+
+# 觀察模式：客戶訊息主動通知 owner/admin 的冷卻（避免洗版）
+import time as _time_mod
+_observe_notify_last: Dict[str, float] = {}   # key=bot|uid -> 上次通知 epoch 秒
+_OBSERVE_NOTIFY_COOLDOWN = 90
 
 # 剛綁定完、正在等對方回覆「怎麼稱呼」的暫存（key = 管理 bot 的 line userId）
 _admin_pending_name: Dict[str, bool] = {}
+
+
+def _staff_in_active_chat(bot_id: str, uid: str) -> list:
+    """回傳目前正在與這位客戶連續對話的員工 line userId 清單。"""
+    return [lid for lid, a in _admin_active_chat.items()
+            if a.get("bot_id") == bot_id and a.get("uid") == uid]
+
+
+async def _relay_customer_msg(bot_id: str, uid: str, msg: str, observe_mode: bool = False):
+    """被動狀態下，把客戶新訊息轉達給員工。
+    ① 有員工正在連續代回這位客戶 → 直接把訊息推給他，保持對話連續。
+    ② 沒人在線上對話時，只有『觀察模式』才主動通知 owner/admin（附卡片可接手／代回），
+       已接手但沒在對話的情況不打擾。"""
+    try:
+        name = await fetch_line_display_name(
+            bot_id, uid, _get_bot_config(bot_id).get("line_channel_access_token")) or "LINE 客戶"
+    except Exception:
+        name = "LINE 客戶"
+
+    active_staff = _staff_in_active_chat(bot_id, uid)
+    if active_staff:
+        for lid in active_staff:
+            try:
+                await _admin_push(lid, [_admin_text_msg(f"👤 {name}：{msg}")])
+            except Exception as e:
+                logging.warning(f"[relay] push to staff failed: {e}")
+        return
+
+    if not observe_mode:
+        return
+
+    key = f"{bot_id}|{uid}"
+    now = _time_mod.time()
+    if now - _observe_notify_last.get(key, 0) < _OBSERVE_NOTIFY_COOLDOWN:
+        return
+    _observe_notify_last[key] = now
+
+    targets = _org_notify_line_ids(bot_id, roles=("owner", "admin"))
+    if not targets:
+        return
+    head = _admin_text_msg(
+        f"👀 觀察模式\n客戶「{name}」傳來訊息：\n「{msg[:60]}」\n可直接接手或代回 👇")
+    try:
+        flex = await _single_conv_flex(bot_id, uid)
+    except Exception:
+        flex = None
+    msgs = [head] + ([flex] if flex else [])
+    for lid in targets:
+        try:
+            await _admin_push(lid, msgs)
+        except Exception as e:
+            logging.warning(f"[observe] notify failed: {e}")
 
 
 async def _admin_push(to: str, messages: list) -> int:
@@ -1996,8 +2072,10 @@ async def _build_admin_conversation_list(app_user: dict) -> list:
     return [flex]
 
 
-async def _admin_send_customer_reply(staff: dict, reply_token: str, pending: dict, text: str):
-    """員工代回：用客戶 bot 把訊息推給客戶，並自動接手（AI 靜音）。"""
+async def _admin_send_customer_reply(staff: dict, reply_token: str, pending: dict, text: str,
+                                     light: bool = False):
+    """員工代回：用客戶 bot 把訊息推給客戶，並自動接手（AI 靜音）。
+    light=True 用於連續對話模式：只回一句簡短確認，不附大張卡片，避免洗版。"""
     bot_id, uid = pending["bot_id"], pending["uid"]
     name = pending.get("name") or "客戶"
     if bot_id not in {b["id"] for b in _staff_bots(staff)}:
@@ -2016,9 +2094,13 @@ async def _admin_send_customer_reply(staff: dict, reply_token: str, pending: dic
             }).execute()
         except Exception:
             pass
-        flex = await _single_conv_flex(bot_id, uid)
-        await _admin_reply(reply_token, [_admin_text_msg(
-            f"✅ 已傳給「{name}」。AI 已暫停，需要時按「恢復 AI 回覆」。"), flex])
+        if light:
+            await _admin_reply(reply_token, [_admin_text_msg(
+                f"✅ 已傳給「{name}」（輸入「結束」離開對話）")])
+        else:
+            flex = await _single_conv_flex(bot_id, uid)
+            await _admin_reply(reply_token, [_admin_text_msg(
+                f"✅ 已傳給「{name}」。AI 已暫停，需要時按「恢復 AI 回覆」。"), flex])
     else:
         await _admin_reply(reply_token, [_admin_text_msg(f"❌ 傳送失敗（{status}），請稍後再試。")])
 
@@ -2034,22 +2116,26 @@ async def _handle_admin_postback(staff: dict, line_uid: str, reply_token: str, p
         bot_id, uid, _get_bot_config(bot_id).get("line_channel_access_token")) or "客戶"
     if action == "mute":
         add_mute(bot_id, uid, muted_by=staff["id"])
+        _admin_active_chat[line_uid] = {"bot_id": bot_id, "uid": uid, "name": name}
         flex = await _single_conv_flex(bot_id, uid)
         bg = _customer_background(bot_id, uid)
         await _admin_reply(reply_token, [_admin_text_msg(
-            f"✅ 已接手「{name}」，AI 已暫停。可按「代回訊息」直接回覆。"),
+            f"✅ 已接手「{name}」，AI 已暫停。\n💬 直接輸入文字即可回覆對方，輸入「結束」離開對話。"),
             _admin_text_msg(bg), flex])
     elif action == "unmute":
         remove_mute(bot_id, uid)
+        if (_admin_active_chat.get(line_uid) or {}).get("uid") == uid:
+            _admin_active_chat.pop(line_uid, None)
         flex = await _single_conv_flex(bot_id, uid)
         await _admin_reply(reply_token, [_admin_text_msg(
             f"✅ 已恢復「{name}」的 AI 自動回覆。"), flex])
     elif action == "reply":
-        _admin_pending_reply[line_uid] = {"bot_id": bot_id, "uid": uid, "name": name}
+        add_mute(bot_id, uid, muted_by=staff["id"])
+        _admin_active_chat[line_uid] = {"bot_id": bot_id, "uid": uid, "name": name}
         bg = _customer_background(bot_id, uid)
         await _admin_reply(reply_token, [
             _admin_text_msg(bg),
-            _admin_text_msg(f"請輸入要傳給「{name}」的訊息（輸入「取消」放棄）：")])
+            _admin_text_msg(f"💬 你正在與「{name}」對話，直接輸入文字即可傳給對方。\n輸入「結束」離開對話。")])
 
 
 async def _handle_admin_event(event: dict):
@@ -2117,13 +2203,23 @@ async def _handle_admin_event(event: dict):
                     "好的，先跳過稱呼。輸入「清單」查看可接手的對話。", _menu_quick_items())])
             return
 
-        pending = _admin_pending_reply.pop(line_uid, None)
-        if pending:
-            if text in ["取消", "cancel"]:
-                await _admin_reply(reply_token, [_admin_text_msg("已取消代回。", _menu_quick_items())])
+        # ── 連續代回：員工正在與某位客戶對話中 ──
+        active = _admin_active_chat.get(line_uid)
+        if active:
+            aname = active.get("name") or "客戶"
+            if text in ["結束", "離開", "退出", "結束對話", "end", "bye", "掰掰"]:
+                _admin_active_chat.pop(line_uid, None)
+                await _admin_reply(reply_token, [_admin_text_msg(
+                    f"已離開與「{aname}」的對話。AI 仍為暫停狀態，需要時在卡片按「恢復 AI 回覆」。",
+                    _menu_quick_items())])
                 return
-            await _admin_send_customer_reply(staff, reply_token, pending, text)
-            return
+            # 切換到指令（清單／摘要等）→ 先離開對話，再往下走指令處理
+            if text in ["清單", "選單", "menu", "list", "對話", "摘要", "統計", "今日", "報表"]:
+                _admin_active_chat.pop(line_uid, None)
+            else:
+                # 一般文字 → 直接傳給客戶，維持連續對話
+                await _admin_send_customer_reply(staff, reply_token, active, text, light=True)
+                return
 
         if text in ["清單", "選單", "menu", "list", "對話"]:
             msgs = await _build_admin_conversation_list(staff)
@@ -2743,6 +2839,47 @@ async def unmute_chat(
         raise HTTPException(400, "只能對 LINE 對話切換手動接手")
     remove_mute(bot_id, line_user_id)
     return {"ok": True, "muted": False}
+
+
+class ReplyRequest(BaseModel):
+    session_id: str
+    text: str
+
+
+@app.post("/bots/{bot_id}/reply")
+async def reply_chat(
+    bot_id: str,
+    body: ReplyRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """真人代回：從後台對話窗直接把訊息推給 LINE 客戶，並自動接手（AI 靜音）＋記錄。"""
+    access = require_bot_access(bot_id, authorization, min_role="editor")
+    line_user_id = _line_user_id_from_session(bot_id, body.session_id)
+    if not line_user_id:
+        raise HTTPException(400, "只能對 LINE 對話代回")
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "訊息不能為空")
+
+    token = _get_bot_config(bot_id).get("line_channel_access_token")
+    if not token:
+        raise HTTPException(400, "此 Bot 尚未設定 LINE，無法代回")
+    status = await push_line_message(line_user_id, text, access_token=token)
+    if status != 200:
+        raise HTTPException(502, f"傳送失敗（{status}），請稍後再試")
+
+    add_mute(bot_id, line_user_id, muted_by=access["app_user"]["id"])
+    staff_name = access["app_user"].get("display_name") or access["app_user"].get("email") or ""
+    try:
+        supabase.table("conversations").insert({
+            "bot_id": bot_id,
+            "question": f"（真人 {staff_name} 代回）",
+            "answer": text,
+            "session_id": body.session_id,
+        }).execute()
+    except Exception as e:
+        logging.warning(f"[reply] conversations insert failed: {e}")
+    return {"ok": True, "muted": True}
 
 
 @app.get("/bots/{bot_id}/conversations/sessions")
