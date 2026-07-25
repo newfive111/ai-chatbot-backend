@@ -117,6 +117,16 @@ async def fetch_line_display_name(bot_id: str, user_id: str, line_token: str) ->
 # 值 = {"msgs": [], "reply_token": str, "task": asyncio.Task}
 _line_buffers: Dict[str, dict] = {}
 
+# 客戶只回貼圖時，餵給 AI 的系統事件訊息（讓 AI 依上下文決定追問或略過）
+_STICKER_SKIP_TOKEN = "SKIP_NO_REPLY"
+_STICKER_EVENT_MSG = (
+    "（系統事件：客戶只傳了一個貼圖，沒有任何文字。）"
+    "請依照對話上下文判斷：若你上一則訊息問了問題、而客戶到目前為止還沒回答，"
+    "請用親切自然的語氣把那個問題再問一次；"
+    f"若客戶先前已經回答過你的問題、這個貼圖只是表達情緒或打招呼，"
+    f"請「只」輸出 {_STICKER_SKIP_TOKEN} 這幾個字、不要有其他任何內容。"
+)
+
 # 垃圾訊息關鍵字（通用，各 bot 可擴充）
 _SPAM_KEYWORDS = ["資金週轉", "債務整合", "房屋二胎", "汽機車二貸", "若需要以上方案", "娛樂城", "博弈"]
 
@@ -1391,6 +1401,11 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
             logging.info(f"[LINE] Silent (handed_off) for {user_id}")
             return
 
+        # 貼圖事件：AI 判斷客戶已回答過 → 輸出 sentinel，靜默略過不回、不記錄
+        if _STICKER_SKIP_TOKEN in answer:
+            logging.info(f"[LINE] Sticker skip for {user_id}")
+            return
+
         # 優先用 push（不依賴 replyToken 過期），失敗才 fallback
         push_ok = await push_line_message(user_id, answer, access_token=line_token, quick_replies=quick_replies)
         if push_ok != 200:
@@ -1460,13 +1475,20 @@ async def line_webhook(bot_id: str, request: Request):
                 bot, bot_id, user_id, buf_key, event["message"]["id"], reply_token, line_token))
             continue
 
-        # ── 貼圖 / 其他非文字：不進 AI，回一句提示引導改打字 ──
+        # ── 貼圖：交給 AI 依上下文判斷（沒答的題目再問一次，已答過就略過不回）──
+        if msg_type == "sticker":
+            if buf_key in _muted_line_users:
+                continue
+            _enqueue_line_text(bot, bot_id, user_id, buf_key, _STICKER_EVENT_MSG, reply_token)
+            continue
+
+        # ── 其他非文字（語音/影片/位置/檔案）：回一句提示引導改打字 ──
         if msg_type != "text":
             if buf_key in _muted_line_users:
                 continue
             await reply_line_message(
                 reply_token,
-                "我這邊收到您的訊息了 😊 但貼圖或這類訊息我看不懂內容，麻煩您用文字告訴我需要什麼，或直接傳圖片給我看喔！",
+                "我這邊收到您的訊息了 😊 但這類訊息我看不懂內容，麻煩您用文字告訴我需要什麼，或直接傳圖片給我看喔！",
                 access_token=line_token, quick_replies=bot.get("quick_replies") or None)
             continue
 
