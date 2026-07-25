@@ -1386,7 +1386,12 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
             if "NO_API_KEY" in str(e):
                 answer = "⚠️ 此 Bot 尚未設定 Gemini API Key，暫時無法回應。"
             else:
-                raise
+                # AI 生成失敗（Gemini 超載/逾時等）→ 給客戶一句 fallback，避免收到一片空白
+                logging.error(f"[LINE] generate_answer failed for {user_id}: {e}")
+                fallback = "不好意思，系統剛剛有點忙碌 😥 可以麻煩您稍等一下再傳一次嗎？"
+                await push_line_message(user_id, fallback, access_token=line_token,
+                                        quick_replies=quick_replies)
+                return
 
         # DATA_SAVE 已觸發 → engine 標記 handed_off → 同步靜音 in-memory set
         from app.chat.engine import get_session_status
