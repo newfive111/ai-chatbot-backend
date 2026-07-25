@@ -83,6 +83,8 @@ PLATFORM_RULES = """
 - 需要判斷現在幾點、今天星期幾時，一律以上方【目前時間】為準，不可自行推算或臆測；沒把握就不要提到具體時間。
 - 客戶沒有問時間時，不要主動報出「現在幾點」。
 - 提到營業／服務時間時，一律使用上方【營業時間】顯示的數值，整段對話務必前後一致，不要一下講一個時間、一下又換另一個。
+- 客戶問「今天」時，「今天」就是上方【目前時間】顯示的那個星期幾，回覆時只能講那一天，絕對不可講成別的星期（例如今天是星期六，就不能說成「星期日」）。
+- 若客戶問今天能不能辦，直接依【目前狀態】回答：非營業日就說今天不提供服務、待上班日再聯繫；不要另外編一個星期幾當理由。
 
 【資料儲存規則 - 最高優先】
 收集資料分兩個階段：
@@ -155,19 +157,25 @@ def _get_system_prompt(
         bh_weekdays = business_hours.get("weekdays", [1, 2, 3, 4, 5])
         bh_days_str = "、".join(f"週{weekday_names[d-1]}" for d in bh_weekdays)
 
-        # 用 time 物件正確比較
+        # 用 time 物件正確比較；區分「非營業日」與「營業日但非營業時間」
+        today_name = f"星期{weekday_names[now_tw.weekday()]}"
+        is_business_day = now_tw.isoweekday() in bh_weekdays
         try:
             _s = datetime.strptime(bh_start, "%H:%M").time()
             _e = datetime.strptime(bh_end, "%H:%M").time()
             _cur = now_tw.time()
-            in_hours = (now_tw.isoweekday() in bh_weekdays) and (_s <= _cur <= _e)
+            if not is_business_day:
+                status_str = f"今天（{today_name}）是非營業日，今天不提供服務"
+            elif _s <= _cur <= _e:
+                status_str = "營業中"
+            else:
+                status_str = f"今天（{today_name}）是營業日，但目前不在營業時間內"
         except Exception:
-            in_hours = None
+            status_str = ""
 
-        status_str = "營業中" if in_hours else ("非營業時間" if in_hours is False else "")
         date_info += f"【營業時間】{bh_days_str} {bh_start}-{bh_end}"
         if status_str:
-            date_info += f"（目前：{status_str}）"
+            date_info += f"\n【目前狀態】{status_str}"
         date_info += "\n"
 
     role_section = custom_system_prompt.strip() if (custom_system_prompt and custom_system_prompt.strip()) \
