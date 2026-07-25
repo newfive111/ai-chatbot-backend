@@ -12,19 +12,30 @@ def _local_embedding(text: str) -> List[float]:
     相似文字因共享 token hash 而有相近的 cosine 相似度。
     """
     import hashlib, math
+
+    def _bump(vec, token, weight):
+        idx = int(hashlib.md5(token.encode()).hexdigest(), 16) % 768
+        vec[idx] += weight
+
     text = text.lower()
     vec = [0.0] * 768
+
+    # 詞層級（英數、有空格的語言）
     words = text.split()
     for word in words:
-        idx = int(hashlib.md5(word.encode()).hexdigest(), 16) % 768
-        vec[idx] += 1.0
+        _bump(vec, word, 1.0)
     for i in range(len(words) - 1):
-        bigram = words[i] + "_" + words[i + 1]
-        idx = int(hashlib.md5(bigram.encode()).hexdigest(), 16) % 768
-        vec[idx] += 0.5
-    for i in range(len(text) - 2):
-        idx = int(hashlib.md5(text[i:i+3].encode()).hexdigest(), 16) % 768
-        vec[idx] += 0.3
+        _bump(vec, words[i] + "_" + words[i + 1], 0.5)
+
+    # 字層級（中文沒有空格，靠逐字 + 相鄰兩字 + 三字取得訊號）
+    chars = [c for c in text if not c.isspace()]
+    for c in chars:
+        _bump(vec, "c:" + c, 0.6)
+    for i in range(len(chars) - 1):
+        _bump(vec, "b:" + chars[i] + chars[i + 1], 0.5)
+    for i in range(len(chars) - 2):
+        _bump(vec, "t:" + chars[i] + chars[i + 1] + chars[i + 2], 0.3)
+
     magnitude = math.sqrt(sum(x * x for x in vec)) or 1.0
     return [x / magnitude for x in vec]
 

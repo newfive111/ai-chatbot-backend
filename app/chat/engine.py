@@ -9,6 +9,22 @@ import app.chat.session_store as session_store
 # 資料交接完成後回給客人的等待語
 HANDOFF_REPLY = "您好！您的資料我們已收到，專員將盡快與您聯繫，請稍候 🙏"
 
+# 關鍵字觸發的否定詞：關鍵字緊接在這些字之後就不算命中（避免「不貸款」誤觸「貸」）
+_NEGATION_CHARS = ("不", "沒", "別", "免", "無", "非", "勿")
+
+
+def _keyword_hit(text: str, kw: str) -> bool:
+    """關鍵字是否命中；排除緊接在否定詞後面的情況。text/kw 皆已 lower。"""
+    start = 0
+    while True:
+        idx = text.find(kw, start)
+        if idx == -1:
+            return False
+        prev = text[idx - 1] if idx > 0 else ""
+        if prev not in _NEGATION_CHARS:
+            return True  # 有一個沒被否定的命中就算觸發
+        start = idx + 1
+
 
 # ──────────────────────────────────────
 # Session 操作（對外介面，engine 以外的模組用這個）
@@ -511,7 +527,7 @@ def generate_answer(
         q_lower = question.lower()
         for kt in keyword_triggers:
             kw = kt.get("keyword", "").lower()
-            if kw and kw in q_lower:
+            if kw and _keyword_hit(q_lower, kw):
                 logging.info(f"[Engine] Keyword match: '{kw}'")
                 return kt.get("reply", "")
 
