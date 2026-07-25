@@ -60,8 +60,26 @@ def store_chunks(bot_id: str, chunks: List[str], api_key: str = "") -> bool:
     return True
 
 
+def bot_has_knowledge(bot_id: str) -> bool:
+    """這個 bot 有沒有任何知識庫 chunk（便宜的 count，避免無知識庫還白跑 embedding API）。"""
+    try:
+        r = supabase.table("knowledge_chunks").select("id", count="exact") \
+            .eq("bot_id", bot_id).limit(1).execute()
+        return bool(r.count and r.count > 0)
+    except Exception:
+        return True  # 查詢失敗時保守走原路，不誤殺檢索
+
+
+# 相似度門檻：低於此值視為不相關，不塞進 prompt（1 - cosine 距離，範圍約 0~1）
+SIMILARITY_THRESHOLD = 0.55
+
+
 def search_similar_chunks(bot_id: str, query: str, top_k: int = 5, api_key: str = "") -> List[str]:
-    """用問題去找最相關的知識庫內容"""
+    """用問題去找最相關的知識庫內容；只回傳相似度過門檻的段落。"""
+    # ① 沒知識庫就直接跳過，省掉 embedding API + RPC
+    if not bot_has_knowledge(bot_id):
+        return []
+
     query_embedding = get_embedding(query, api_key)
     result = supabase.rpc(
         "match_chunks",
@@ -71,4 +89,14 @@ def search_similar_chunks(bot_id: str, query: str, top_k: int = 5, api_key: str 
             "match_count": top_k
         }
     ).execute()
-    return [row["content"] for row in result.data]
+    rows = result.data or []
+
+    # ② 相似度門檻過濾：不夠相關的段落不塞進 prompt，避免雜訊干擾回覆
+    filtered = [r["content"] for r in rows
+                if r.get("similarity") is None or r["similarity"] >= SIMILARITY_THRESHOLD]
+    # 全部都被濾掉時，至少保留最相關的一段（避免門檻誤殺導致完全沒參考）
+    if not filtered and rows:
+        top = max(rows, key=lambda r: r.get("similarity") or 0)
+        if (top.get("similarity") or 0) >= SIMILARITY_THRESHOLD * 0.8:
+            filtered = [top["content"]]
+    return filtered
