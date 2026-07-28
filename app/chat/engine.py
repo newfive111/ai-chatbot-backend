@@ -454,6 +454,32 @@ def _extract_json_object(text: str, marker: str = "DATA_SAVE") -> Optional[tuple
     return None
 
 
+def render_card(template: Optional[str], data: dict) -> str:
+    """依租客自訂範本把 {欄位} 換成收集到的值；沒設定範本就每欄一行。"""
+    if template and template.strip():
+        def _sub(m):
+            key = m.group(1).strip()
+            return str(data.get(key, "")).strip()
+        return re.sub(r"\{([^{}]+)\}", _sub, template).strip()
+    return "\n".join(f"{k}：{str(v).strip()}" for k, v in data.items() if str(v).strip())
+
+
+def _save_submission(bot_id: str, session_id: str, data: dict, card_text: str, display_name: Optional[str]):
+    """把收集完成的一筆資料存進 submissions（後台客戶名單用）。失敗只 log。"""
+    try:
+        from app.chat.session_store import _sb
+        _sb.table("submissions").insert({
+            "bot_id": bot_id,
+            "session_id": session_id,
+            "display_name": display_name,
+            "data": data,
+            "card_text": card_text,
+        }).execute()
+        logging.info(f"[Submission] saved bot={bot_id} session={session_id[:8]}")
+    except Exception as e:
+        logging.warning(f"[Submission] save failed: {e}")
+
+
 def _write_data_to_sheet(json_str: str, sheet_id: str, session_id: str, marker: str, extra_sheet_fields: Optional[dict]) -> Optional[str]:
     """解析 JSON 並寫入 Sheet，失敗時只 log warning。回傳 display_name（或 None）。"""
     try:
@@ -476,17 +502,18 @@ def _extract_and_save_data(
     sheet_id: str,
     session_id: str,
     extra_sheet_fields: Optional[dict] = None,
-) -> Tuple[str, bool, Optional[str]]:
+) -> Tuple[str, bool, Optional[str], Optional[dict]]:
     """
     偵測 AI 回覆中的資料標記，寫入 Google Sheet。
     - DATA_PARTIAL: {...} → 部分存檔，不觸發 handed_off
     - DATA_SAVE: {...}    → 完整存檔，觸發 handed_off（靜默）
     支援英文冒號與中文全形冒號，使用括號平衡法提取 JSON。
-    回傳 (清理後文字, 是否找到DATA_SAVE, display_name)
+    回傳 (清理後文字, 是否找到DATA_SAVE, display_name, DATA_SAVE資料dict)
     """
     cleaned = raw_reply
     found_final = False
     saved_display_name: Optional[str] = None
+    final_data: Optional[dict] = None
 
     def _strip_marker(text: str, result: tuple) -> str:
         """用精確位置移除 marker 段落，避免 regex 截斷問題。"""
@@ -510,13 +537,17 @@ def _extract_and_save_data(
     final_result = _extract_json_object(cleaned, marker="DATA_SAVE")
     if final_result:
         saved_display_name = _write_data_to_sheet(final_result[0], sheet_id, session_id, "DATA_SAVE", extra_sheet_fields)
+        try:
+            final_data = json.loads(final_result[0])
+        except Exception:
+            final_data = None
         cleaned = _strip_marker(cleaned, final_result)
         found_final = True
 
     if not partial_result and not final_result:
         logging.debug(f"[Engine] No data marker in reply (len={len(raw_reply)})")
 
-    return cleaned, found_final, saved_display_name
+    return cleaned, found_final, saved_display_name, final_data
 
 
 def _generate_conversation_summary(api_key: str, history: list, last_question: str) -> str:
@@ -569,6 +600,8 @@ def generate_answer(
     extra_sheet_fields: Optional[dict] = None,
     # 下班時間自動回應
     off_hours_message: Optional[str] = None,
+    # 客戶名單資料卡排版範本（{欄位} 佔位符）
+    card_template: Optional[str] = None,
 ) -> str:
     if not api_key:
         raise Exception("NO_API_KEY")
@@ -628,10 +661,17 @@ def generate_answer(
             raw_reply = _call_ai(api_key, system_prompt, history, question)
 
         if sheet_id and session_id:
-            clean_reply, data_saved, saved_display_name = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
+            clean_reply, data_saved, saved_display_name, final_data = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
             if data_saved:
                 session["status"] = "handed_off"
                 logging.info(f"[Engine] {session_id[:8]} → handed_off (DATA_SAVE)")
+                # 存進客戶名單（後台可複製的資料卡）
+                if final_data:
+                    try:
+                        card = render_card(card_template, final_data)
+                        _save_submission(bot_id, session_id, final_data, card, saved_display_name)
+                    except Exception as _e:
+                        logging.warning(f"[Submission] render/save failed: {_e}")
                 # 對話摘要：非同步補寫到試算表
                 try:
                     summary = _generate_conversation_summary(api_key, history, question)

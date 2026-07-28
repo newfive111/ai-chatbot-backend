@@ -988,6 +988,8 @@ class UpdateBotRequest(BaseModel):
     off_hours_message: Optional[str] = None
     # 觀察模式：開啟時 AI 不回覆，只記錄客戶訊息並通知員工代回
     observe_mode: Optional[bool] = None
+    # 客戶名單資料卡排版範本（{欄位} 佔位符）
+    card_template: Optional[str] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -1004,7 +1006,7 @@ async def update_bot(
         elif k in ("collect_fields", "quick_replies", "keyword_triggers"):
             # 明確傳入空 list → 允許清空
             update_data[k] = []
-        elif k in ("system_prompt", "welcome_message"):
+        elif k in ("system_prompt", "welcome_message", "card_template"):
             # 明確傳入空字串 → 允許清空
             update_data[k] = ""
 
@@ -1208,7 +1210,7 @@ async def chat(bot_id: str, body: ChatRequest):
 
     result = supabase.table("bots").select(
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, "
-        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, off_hours_message"
+        "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, off_hours_message, card_template"
     ).eq("id", bot_id).execute()
     bot_data = result.data[0] if result.data else {}
     bot_name = bot_data.get("name", "AI 助理")
@@ -1221,6 +1223,7 @@ async def chat(bot_id: str, body: ChatRequest):
     business_hours = bot_data.get("business_hours") or None
     keyword_triggers = bot_data.get("keyword_triggers") or None
     off_hours_message = bot_data.get("off_hours_message") or None
+    card_template = bot_data.get("card_template") or None
 
     try:
         answer = generate_answer(
@@ -1235,6 +1238,7 @@ async def chat(bot_id: str, body: ChatRequest):
             business_hours=business_hours,
             keyword_triggers=keyword_triggers,
             off_hours_message=off_hours_message,
+            card_template=card_template,
         )
     except Exception as e:
         if "NO_API_KEY" in str(e):
@@ -1327,7 +1331,7 @@ def _get_bot_config(bot_id: str) -> dict:
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, quick_replies, "
         "line_channel_secret, line_channel_access_token, "
         "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds, "
-        "instagram_page_token, instagram_account_id, facebook_page_id, off_hours_message, observe_mode"
+        "instagram_page_token, instagram_account_id, facebook_page_id, off_hours_message, observe_mode, card_template"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
 
@@ -1364,6 +1368,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
         business_hours = bot.get("business_hours") or None
         keyword_triggers  = bot.get("keyword_triggers") or None
         off_hours_message = bot.get("off_hours_message") or None
+        card_template     = bot.get("card_template") or None
 
         # ── 觀察模式 / 已被真人接手：AI 不回覆，只記錄客戶訊息並轉達給員工 ──
         observe_mode = bool(bot.get("observe_mode"))
@@ -1400,6 +1405,7 @@ async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce
                 keyword_triggers=keyword_triggers,
                 extra_sheet_fields=extra_sheet,
                 off_hours_message=off_hours_message,
+                card_template=card_template,
             )
         except Exception as e:
             if "NO_API_KEY" in str(e):
@@ -2905,6 +2911,38 @@ async def reply_chat(
     return {"ok": True, "muted": True}
 
 
+@app.get("/bots/{bot_id}/submissions")
+async def list_submissions(
+    bot_id: str,
+    days: int = 0,
+    authorization: Optional[str] = Header(None)
+):
+    """列出 bot 收集完成的客戶名單（DATA_SAVE 存下的資料卡，可複製）。"""
+    require_bot_access(bot_id, authorization, min_role="viewer")
+    query = supabase.table("submissions")\
+        .select("id, session_id, display_name, data, card_text, created_at")\
+        .eq("bot_id", bot_id)\
+        .order("created_at", desc=True)
+    if days > 0:
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        query = query.gte("created_at", since)
+    rows = query.limit(500).execute()
+    return {"submissions": rows.data or []}
+
+
+@app.delete("/bots/{bot_id}/submissions/{submission_id}")
+async def delete_submission(
+    bot_id: str,
+    submission_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    """刪除一筆客戶名單資料。"""
+    require_bot_access(bot_id, authorization, min_role="editor")
+    supabase.table("submissions").delete()\
+        .eq("id", submission_id).eq("bot_id", bot_id).execute()
+    return {"ok": True}
+
+
 @app.get("/bots/{bot_id}/conversations/sessions")
 async def list_conversation_sessions(
     bot_id: str,
@@ -3149,6 +3187,7 @@ async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
         slot_duration  = bot.get("slot_duration_minutes") or 60
         business_hours = bot.get("business_hours") or None
         keyword_triggers = bot.get("keyword_triggers") or None
+        card_template  = bot.get("card_template") or None
         session_id     = f"ig_{bot_id}_{sender_id}"
 
         try:
@@ -3163,6 +3202,7 @@ async def _process_instagram_message(bot_id: str, sender_id: str, text: str):
                 slot_duration_minutes=slot_duration,
                 business_hours=business_hours,
                 keyword_triggers=keyword_triggers,
+                card_template=card_template,
             )
         except Exception as e:
             if "NO_API_KEY" in str(e):
@@ -3200,6 +3240,7 @@ async def _process_instagram_comment(bot_id: str, comment_id: str, commenter_id:
         slot_duration    = bot.get("slot_duration_minutes") or 60
         business_hours   = bot.get("business_hours") or None
         keyword_triggers = bot.get("keyword_triggers") or None
+        card_template    = bot.get("card_template") or None
         # 用 commenter_id 保持對話記憶（每位留言者獨立 session）
         session_id       = f"ig_cmt_{bot_id}_{commenter_id}"
 
@@ -3215,6 +3256,7 @@ async def _process_instagram_comment(bot_id: str, comment_id: str, commenter_id:
                 slot_duration_minutes=slot_duration,
                 business_hours=business_hours,
                 keyword_triggers=keyword_triggers,
+                card_template=card_template,
             )
         except Exception as e:
             if "NO_API_KEY" in str(e):
