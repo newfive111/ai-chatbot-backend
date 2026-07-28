@@ -2920,7 +2920,7 @@ async def list_submissions(
     """列出 bot 收集完成的客戶名單（DATA_SAVE 存下的資料卡，可複製）。"""
     require_bot_access(bot_id, authorization, min_role="viewer")
     query = supabase.table("submissions")\
-        .select("id, session_id, display_name, data, card_text, created_at")\
+        .select("id, session_id, display_name, data, card_text, handled, created_at")\
         .eq("bot_id", bot_id)\
         .order("created_at", desc=True)
     if days > 0:
@@ -2928,6 +2928,24 @@ async def list_submissions(
         query = query.gte("created_at", since)
     rows = query.limit(500).execute()
     return {"submissions": rows.data or []}
+
+
+class SubmissionHandledRequest(BaseModel):
+    handled: bool
+
+
+@app.patch("/bots/{bot_id}/submissions/{submission_id}")
+async def update_submission_handled(
+    bot_id: str,
+    submission_id: str,
+    body: SubmissionHandledRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """標記客戶名單某筆為已處理／未處理。"""
+    require_bot_access(bot_id, authorization, min_role="editor")
+    supabase.table("submissions").update({"handled": body.handled})\
+        .eq("id", submission_id).eq("bot_id", bot_id).execute()
+    return {"ok": True, "handled": body.handled}
 
 
 @app.delete("/bots/{bot_id}/submissions/{submission_id}")
