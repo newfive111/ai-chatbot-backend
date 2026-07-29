@@ -381,7 +381,10 @@ def _call_ai_with_calendar(
                     data  = create_booking(
                         calendar_id, title, args["date"], args["time"], slot_duration, desc
                     )
-                    result = f"預約成功！{args['date']} {args['time']}，{name} 的 {svc} 已登記。"
+                    if data.get("conflict"):
+                        result = f"{args['date']} {args['time']} 剛好被別人預約走了，請告訴客人這個時段已滿，並主動推薦其他還有空的時段。"
+                    else:
+                        result = f"預約成功！{args['date']} {args['time']}，{name} 的 {svc} 已登記。"
                 else:
                     result = "未知工具"
 

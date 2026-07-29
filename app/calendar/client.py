@@ -79,13 +79,16 @@ def get_available_slots(
                     be = be.replace(tzinfo=tz_tw)
                 busy.append((bs, be))
 
+        # 若查詢的是今天，過濾掉已經過去的時段
+        now_tw = datetime.now(tz_tw)
+
         # 產生所有可能時段，排除忙碌的
         available = []
         cur = day_start
         while cur + timedelta(minutes=duration_minutes) <= day_end:
             slot_end = cur + timedelta(minutes=duration_minutes)
             is_free = all(slot_end <= bs or cur >= be for bs, be in busy)
-            if is_free:
+            if is_free and cur > now_tw:
                 available.append(cur.strftime("%H:%M"))
             cur += timedelta(minutes=duration_minutes)
 
@@ -118,6 +121,28 @@ def create_booking(
         date  = datetime.strptime(date_str, "%Y-%m-%d")
         start = datetime(date.year, date.month, date.day, h, m, tzinfo=tz_tw)
         end   = start + timedelta(minutes=duration_minutes)
+
+        # 寫入前再確認一次該時段仍空著，避免兩人同時預約撞單
+        existing = service.events().list(
+            calendarId=calendar_id,
+            timeMin=start.isoformat(),
+            timeMax=end.isoformat(),
+            singleEvents=True,
+        ).execute()
+        for ev in existing.get("items", []):
+            ev_start = ev["start"].get("dateTime", "")
+            ev_end   = ev["end"].get("dateTime", "")
+            if ev_start and ev_end:
+                bs = datetime.fromisoformat(ev_start)
+                be = datetime.fromisoformat(ev_end)
+                if bs.tzinfo is None:
+                    bs = bs.replace(tzinfo=tz_tw)
+                if be.tzinfo is None:
+                    be = be.replace(tzinfo=tz_tw)
+                # 時段有重疊 → 已被預約走
+                if start < be and end > bs:
+                    logging.info(f"[Calendar] Slot taken: {date_str} {time_str}")
+                    return {"conflict": True}
 
         event = {
             "summary":     title,
