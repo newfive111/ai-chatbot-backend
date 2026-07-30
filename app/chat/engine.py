@@ -497,11 +497,13 @@ def _write_data_to_sheet(json_str: str, sheet_id: str, session_id: str, marker: 
     """解析 JSON 並寫入 Sheet，失敗時只 log warning。回傳 display_name（或 None）。"""
     try:
         data: dict = json.loads(json_str)
-        fields = list(data.keys())
-        from app.sheets.client import upsert_row
         display_name = _get_display_name(data)
-        upsert_row(sheet_id, session_id, fields, data, display_name=display_name, extra_fields=extra_sheet_fields)
-        logging.info(f"[Sheet] {marker} written session={session_id[:8]} fields={fields}")
+        # 沒綁 Google Sheet 也要能回傳 display_name（供客戶名單使用），只是不寫試算表
+        if sheet_id:
+            fields = list(data.keys())
+            from app.sheets.client import upsert_row
+            upsert_row(sheet_id, session_id, fields, data, display_name=display_name, extra_fields=extra_sheet_fields)
+            logging.info(f"[Sheet] {marker} written session={session_id[:8]} fields={fields}")
         return display_name
     except json.JSONDecodeError as e:
         logging.warning(f"[Engine] {marker} JSON parse error: {e} | raw={json_str[:200]}")
@@ -673,27 +675,28 @@ def generate_answer(
         else:
             raw_reply = _call_ai(api_key, system_prompt, history, question)
 
-        if sheet_id and session_id:
+        if session_id:
             clean_reply, data_saved, saved_display_name, final_data = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
             if data_saved:
                 session["status"] = "handed_off"
                 logging.info(f"[Engine] {session_id[:8]} → handed_off (DATA_SAVE)")
-                # 存進客戶名單（後台可複製的資料卡）
+                # 存進客戶名單（後台可複製的資料卡）— 與 Google Sheet 無關，一律儲存
                 if final_data:
                     try:
                         card = render_card(card_template, final_data)
                         _save_submission(bot_id, session_id, final_data, card, saved_display_name)
                     except Exception as _e:
                         logging.warning(f"[Submission] render/save failed: {_e}")
-                # 對話摘要：非同步補寫到試算表
-                try:
-                    summary = _generate_conversation_summary(api_key, history, question)
-                    if summary:
-                        from app.sheets.client import update_extra_fields
-                        update_extra_fields(sheet_id, session_id, {"對話摘要": summary}, display_name=saved_display_name)
-                        logging.info(f"[Engine] Summary written for {session_id[:8]}: {summary[:30]}")
-                except Exception as _e:
-                    logging.warning(f"[Engine] Summary write failed: {_e}")
+                # 對話摘要：非同步補寫到試算表（僅在有綁 Sheet 時）
+                if sheet_id:
+                    try:
+                        summary = _generate_conversation_summary(api_key, history, question)
+                        if summary:
+                            from app.sheets.client import update_extra_fields
+                            update_extra_fields(sheet_id, session_id, {"對話摘要": summary}, display_name=saved_display_name)
+                            logging.info(f"[Engine] Summary written for {session_id[:8]}: {summary[:30]}")
+                    except Exception as _e:
+                        logging.warning(f"[Engine] Summary write failed: {_e}")
                 # 下班時間：資料收完後附上通知
                 if _is_off_hours and off_hours_message:
                     clean_reply = clean_reply + "\n\n" + off_hours_message
