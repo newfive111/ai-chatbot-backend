@@ -228,7 +228,7 @@ def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> 
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=1024,
+                    max_output_tokens=2048,
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             )
@@ -351,7 +351,7 @@ def _call_ai_with_calendar(
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 tools=[tools],
-                max_output_tokens=1024,
+                max_output_tokens=2048,
             )
         )
         candidate = response.candidates[0]
