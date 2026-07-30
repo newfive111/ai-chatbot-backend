@@ -675,6 +675,7 @@ def generate_answer(
         else:
             raw_reply = _call_ai(api_key, system_prompt, history, question)
 
+        data_saved = False
         if session_id:
             clean_reply, data_saved, saved_display_name, final_data = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
             if data_saved:
@@ -703,6 +704,12 @@ def generate_answer(
                     logging.info(f"[Engine] Off-hours message appended after DATA_SAVE")
         else:
             clean_reply = re.sub(r'\n?DATA_(?:SAVE|PARTIAL):\s*\{.*?\}\n?', '', raw_reply, flags=re.DOTALL).strip()
+
+        # 安全網：這則回覆被清成空字串（模型只吐了 marker，或回傳空 candidate），
+        # 避免前端出現空白泡泡看起來像「當掉」；記錄原始回覆方便追蹤。
+        if not (clean_reply or "").strip() and not data_saved:
+            logging.warning(f"[Engine] Empty reply after processing session={(session_id or '')[:8]} raw={raw_reply[:300]!r}")
+            clean_reply = "不好意思，我剛剛恍神了一下 😅 方便再說一次嗎？"
 
         if session_id and session is not None:
             session["history"] = history + [
