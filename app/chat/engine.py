@@ -467,6 +467,30 @@ def _extract_json_object(text: str, marker: str = "DATA_SAVE") -> Optional[tuple
     return None
 
 
+def _loads_lenient(s: str) -> Optional[dict]:
+    """
+    先嚴格 json.loads；失敗再做安全修復後重試（LLM 常見的 JSON 小瑕疵）：
+    - 全形引號 “ ” ‘ ’ → 直引號
+    - 全形冒號／逗號當分隔符 → 半形
+    - 物件／陣列結尾多餘逗號
+    真的解不出來就 log 原始字串並回傳 None。
+    """
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    repaired = s
+    repaired = (repaired.replace("\u201c", '"').replace("\u201d", '"')
+                        .replace("\u2018", "'").replace("\u2019", "'"))
+    repaired = repaired.replace("\uff1a", ":").replace("\uff0c", ",")
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)   # 移除結尾多餘逗號
+    try:
+        return json.loads(repaired)
+    except Exception as e:
+        logging.warning(f"[Engine] DATA JSON 無法解析（修復後仍失敗）: {e} | raw={s[:400]!r}")
+        return None
+
+
 def render_card(template: Optional[str], data: dict) -> str:
     """依租客自訂範本把 {欄位} 換成收集到的值；沒設定範本就每欄一行。"""
     if template and template.strip():
@@ -496,7 +520,9 @@ def _save_submission(bot_id: str, session_id: str, data: dict, card_text: str, d
 def _write_data_to_sheet(json_str: str, sheet_id: str, session_id: str, marker: str, extra_sheet_fields: Optional[dict]) -> Optional[str]:
     """解析 JSON 並寫入 Sheet，失敗時只 log warning。回傳 display_name（或 None）。"""
     try:
-        data: dict = json.loads(json_str)
+        data = _loads_lenient(json_str)
+        if data is None:
+            return None
         display_name = _get_display_name(data)
         # 沒綁 Google Sheet 也要能回傳 display_name（供客戶名單使用），只是不寫試算表
         if sheet_id:
@@ -505,8 +531,6 @@ def _write_data_to_sheet(json_str: str, sheet_id: str, session_id: str, marker: 
             upsert_row(sheet_id, session_id, fields, data, display_name=display_name, extra_fields=extra_sheet_fields)
             logging.info(f"[Sheet] {marker} written session={session_id[:8]} fields={fields}")
         return display_name
-    except json.JSONDecodeError as e:
-        logging.warning(f"[Engine] {marker} JSON parse error: {e} | raw={json_str[:200]}")
     except Exception as e:
         logging.warning(f"[Sheet] {marker} write failed: {e}")
     return None
@@ -552,10 +576,7 @@ def _extract_and_save_data(
     final_result = _extract_json_object(cleaned, marker="DATA_SAVE")
     if final_result:
         saved_display_name = _write_data_to_sheet(final_result[0], sheet_id, session_id, "DATA_SAVE", extra_sheet_fields)
-        try:
-            final_data = json.loads(final_result[0])
-        except Exception:
-            final_data = None
+        final_data = _loads_lenient(final_result[0])
         cleaned = _strip_marker(cleaned, final_result)
         found_final = True
 
@@ -688,6 +709,8 @@ def generate_answer(
                         _save_submission(bot_id, session_id, final_data, card, saved_display_name)
                     except Exception as _e:
                         logging.warning(f"[Submission] render/save failed: {_e}")
+                else:
+                    logging.warning(f"[Submission] DATA_SAVE 觸發但 final_data 為空，未存客戶名單 session={session_id[:8]}")
                 # 對話摘要：非同步補寫到試算表（僅在有綁 Sheet 時）
                 if sheet_id:
                     try:
