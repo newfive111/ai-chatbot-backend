@@ -141,6 +141,7 @@ def _get_system_prompt(
     has_sheet: bool = False,
     has_calendar: bool = False,
     business_hours: Optional[dict] = None,
+    collect_fields: Optional[List[str]] = None,
 ) -> str:
     """
     組合最終 system prompt：[角色設定] + [知識庫] + [預約規則?] + [平台底層規則]
@@ -199,7 +200,22 @@ def _get_system_prompt(
     if not has_sheet:
         rules = rules.split("【DATA_SAVE 完成交接語】")[0].rstrip()
 
-    return f"{role_section}{date_info}{kb_section}{calendar_section}{rules}"
+    # 固定鍵名：若老闆有設「要收集的欄位」，強制 DATA_PARTIAL / DATA_SAVE 的 JSON
+    # 鍵名一律用清單裡的原字，避免 AI 每次自己換名（稱呼/聯絡電話…）害資料卡範本對不上。
+    # 額外收到的資訊不禁止，可用其他鍵名照常保留。
+    fixed_keys = ""
+    if has_sheet and collect_fields:
+        names = "、".join(f.strip() for f in collect_fields if f and f.strip())
+        if names:
+            fixed_keys = (
+                "\n\n【資料鍵名固定 - 最高優先】\n"
+                f"輸出 DATA_PARTIAL / DATA_SAVE 的 JSON 時，只要有收集到下列資訊，鍵名一律用這些「原字」，"
+                f"用字要一模一樣，絕對不可改寫或用同義詞（例如不可把「電話」寫成「聯絡電話」、「姓名」寫成「稱呼」）：\n"
+                f"{names}\n"
+                "若有清單以外的額外資訊，可自行取名照常放入，但清單內的欄位務必用上面的固定名稱。"
+            )
+
+    return f"{role_section}{date_info}{kb_section}{calendar_section}{rules}{fixed_keys}"
 
 
 # ──────────────────────────────────────
@@ -719,6 +735,7 @@ def generate_answer(
         has_sheet=bool(sheet_id),
         has_calendar=has_calendar,
         business_hours=_bh,
+        collect_fields=collect_fields,
     )
 
     # ── 路徑 A：有自訂 prompt → LLM 全程主導（含 calendar 支援）──
