@@ -84,7 +84,9 @@ PLATFORM_RULES = """
 - 客戶沒有問時間時，不要主動報出「現在幾點」。
 - 提到營業／服務時間時，一律使用上方【營業時間】顯示的數值，整段對話務必前後一致，不要一下講一個時間、一下又換另一個。
 - 客戶問「今天」時，「今天」就是上方【目前時間】顯示的那個星期幾，回覆時只能講那一天，絕對不可講成別的星期（例如今天是星期六，就不能說成「星期日」）。
-- 客戶說「明天」「後天」「大後天」「下週幾」等相對日期時，一律「查上方【日期對照】表」換算成正確的年月日與星期，絕對不要自己心算；跟客戶確認時間時，把換算出的日期與星期一起講出來讓對方確認（例如「後天（8/1 星期五）下午五點」）。
+- 客戶說「明天」「後天」「大後天」等相對日期時，一律「查上方【日期對照】表」換算成正確的年月日與星期，絕對不要自己心算。
+- 客戶說「星期X／禮拜X／週X」時，查【本週剩餘】表；說「下週X」時，查【下週】表，直接抄表上「星期X=」對應的日期，絕對不要自己算週數（例如今天星期五時「下週三」就是查【下週】表的星期三，不可算成星期四那天）。
+- 跟客戶確認時間時，把查到的日期與星期一起講出來讓對方確認（例如「後天（8/1 星期五）下午五點」）。若客戶回覆的星期幾和你講的日期對不上，代表你抓錯日期，要「重查上表」改成星期幾正確的那一天，不要硬拗說某日期是別的星期。
 - 若客戶問今天能不能辦，直接依【目前狀態】回答：非營業日就說今天不提供服務、待上班日再聯繫；不要另外編一個星期幾當理由。
 
 【資料儲存規則 - 最高優先】
@@ -157,7 +159,7 @@ def _get_system_prompt(
     weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
     date_info = f"\n\n【目前時間】{now_tw.strftime('%Y-%m-%d')} 星期{weekday_names[now_tw.weekday()]} {now_tw.strftime('%H:%M')}\n"
 
-    # 未來幾天的絕對日期對照，避免 AI 自己心算「明天/後天/下週幾」出錯
+    # 未來幾天的絕對日期對照，避免 AI 自己心算「明天/後天/大後天」出錯
     rel_names = {0: "今天", 1: "明天", 2: "後天", 3: "大後天"}
     upcoming = []
     for i in range(0, 8):
@@ -165,6 +167,21 @@ def _get_system_prompt(
         label = rel_names.get(i, f"{i}天後")
         upcoming.append(f"{label}={d.strftime('%Y-%m-%d')}（星期{weekday_names[d.weekday()]}）")
     date_info += "【日期對照】" + "、".join(upcoming) + "\n"
+
+    # 本週剩餘 / 下週 的「星期幾→日期」對照，避免 AI 把「下週三」算成別天
+    days_to_sunday = 7 - now_tw.isoweekday()  # 到本週日還有幾天
+    this_week = [
+        f"星期{weekday_names[(now_tw + timedelta(days=i)).weekday()]}="
+        f"{(now_tw + timedelta(days=i)).strftime('%Y-%m-%d')}"
+        for i in range(0, days_to_sunday + 1)
+    ]
+    next_week = [
+        f"星期{weekday_names[(now_tw + timedelta(days=i)).weekday()]}="
+        f"{(now_tw + timedelta(days=i)).strftime('%Y-%m-%d')}"
+        for i in range(days_to_sunday + 1, days_to_sunday + 8)
+    ]
+    date_info += "【本週剩餘】" + "、".join(this_week) + "\n"
+    date_info += "【下週】" + "、".join(next_week) + "\n"
 
     # 加入營業時間資訊，避免 AI 亂猜
     if business_hours:
