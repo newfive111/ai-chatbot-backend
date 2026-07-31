@@ -392,6 +392,10 @@ def _call_ai_with_calendar(
         contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
     contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
 
+    # 成功建立預約時，記下工具實際用的結構化參數（固定鍵名），
+    # 供後續產生「客戶名單資料卡」使用，避免仰賴 AI 自己取的 DATA_SAVE 鍵名（會漂）。
+    booking_data: Optional[dict] = None
+
     for _ in range(6):
         response = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -408,9 +412,10 @@ def _call_ai_with_calendar(
         fc_parts = [p for p in candidate.content.parts if p.function_call]
         if not fc_parts:
             # 最終文字回覆
-            return "".join(
+            text = "".join(
                 p.text for p in candidate.content.parts if hasattr(p, "text") and p.text
             ).strip() or "處理完成"
+            return text, booking_data
 
         # 執行工具
         tool_response_parts = []
@@ -447,6 +452,14 @@ def _call_ai_with_calendar(
                         result = f"{date_label} {args['time']} 剛好被別人預約走了，請告訴客人這個時段已滿，並主動推薦其他還有空的時段。"
                     else:
                         result = f"預約成功！已登記於 {date_label} {args['time']}，{name} 的 {svc}。跟客人確認時，務必用「{date_label} {args['time']}」這個完全相同的日期、星期與時間，絕對不要改成別天或別的星期。"
+                        # 用工具實際參數記錄一筆固定鍵名的資料，供資料卡使用
+                        booking_data = {
+                            "姓名": name,
+                            "電話": phone,
+                            "服務項目": svc,
+                            "預約日期": args["date"],
+                            "預約時間": args["time"],
+                        }
                 else:
                     result = "未知工具"
 
@@ -464,7 +477,7 @@ def _call_ai_with_calendar(
 
         contents.append(types.Content(role="tool", parts=tool_response_parts))
 
-    return "處理超時，請再試一次。"
+    return "處理超時，請再試一次。", booking_data
 
 
 # ──────────────────────────────────────
@@ -787,8 +800,9 @@ def generate_answer(
             history = []
 
         # 路徑選擇：calendar / 純文字
+        booking_data = None
         if has_calendar:
-            raw_reply = _call_ai_with_calendar(
+            raw_reply, booking_data = _call_ai_with_calendar(
                 api_key, system_prompt, history, question,
                 calendar_id, slot_duration_minutes, _bh
             )
@@ -801,15 +815,20 @@ def generate_answer(
             if data_saved:
                 session["status"] = "handed_off"
                 logging.info(f"[Engine] {session_id[:8]} → handed_off (DATA_SAVE)")
+                # 預約情境：以工具實際參數（固定鍵名）為準，避免 AI 的 DATA_SAVE 鍵名漂移
+                # 導致資料卡欄位對不上範本（出現空白行或重複行）。
+                card_data = booking_data if booking_data else final_data
+                if booking_data and not saved_display_name:
+                    saved_display_name = booking_data.get("姓名") or saved_display_name
                 # 存進客戶名單（後台可複製的資料卡）— 與 Google Sheet 無關，一律儲存
-                if final_data:
+                if card_data:
                     try:
-                        card = render_card(card_template, final_data)
-                        _save_submission(bot_id, session_id, final_data, card, saved_display_name)
+                        card = render_card(card_template, card_data)
+                        _save_submission(bot_id, session_id, card_data, card, saved_display_name)
                     except Exception as _e:
                         logging.warning(f"[Submission] render/save failed: {_e}")
                 else:
-                    logging.warning(f"[Submission] DATA_SAVE 觸發但 final_data 為空，未存客戶名單 session={session_id[:8]}")
+                    logging.warning(f"[Submission] DATA_SAVE 觸發但資料為空，未存客戶名單 session={session_id[:8]}")
                 # 對話摘要：非同步補寫到試算表（僅在有綁 Sheet 時）
                 if sheet_id:
                     try:
