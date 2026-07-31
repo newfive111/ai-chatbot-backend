@@ -492,13 +492,17 @@ def _loads_lenient(s: str) -> Optional[dict]:
 
 
 def render_card(template: Optional[str], data: dict) -> str:
-    """依租客自訂範本把 {欄位} 換成收集到的值；沒設定範本就每欄一行。"""
-    if template and template.strip():
-        def _sub(m):
-            key = m.group(1).strip()
-            return str(data.get(key, "")).strip()
-        return re.sub(r"\{([^{}]+)\}", _sub, template).strip()
-    return "\n".join(f"{k}：{str(v).strip()}" for k, v in data.items() if str(v).strip())
+    """卡片一律依 DATA_SAVE 實際收集到的欄位「照實排版」（每欄一行）。
+
+    這樣欄位名稱永遠對得上（跟著資料長），老闆不需要自己維護範本的
+    {佔位符} 拼字，避免名稱對不上導致卡片空白。
+    template 參數保留以相容呼叫端，目前不使用（方案 A）。
+    """
+    return "\n".join(
+        f"{k}：{str(v).strip()}"
+        for k, v in data.items()
+        if str(v).strip()
+    )
 
 
 def _save_submission(bot_id: str, session_id: str, data: dict, card_text: str, display_name: Optional[str]):
