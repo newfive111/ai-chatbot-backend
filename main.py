@@ -2930,6 +2930,32 @@ async def list_submissions(
     return {"submissions": rows.data or []}
 
 
+@app.get("/bots/{bot_id}/submission-fields")
+async def list_submission_fields(
+    bot_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    """回傳這個 bot 最近幾筆 submission 實際出現過的欄位 key，給範本編輯器當可點按鈕。"""
+    require_bot_access(bot_id, authorization, min_role="viewer")
+    rows = supabase.table("submissions")\
+        .select("data")\
+        .eq("bot_id", bot_id)\
+        .order("created_at", desc=True)\
+        .limit(20).execute()
+    # 依「最近先出現」順序收集欄位，保留第一次見到的排序、去重
+    fields: list[str] = []
+    seen: set = set()
+    for r in (rows.data or []):
+        data = r.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        for k in data.keys():
+            if k not in seen:
+                seen.add(k)
+                fields.append(k)
+    return {"fields": fields}
+
+
 class SubmissionHandledRequest(BaseModel):
     handled: bool
 

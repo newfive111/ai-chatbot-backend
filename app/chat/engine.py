@@ -491,13 +491,55 @@ def _loads_lenient(s: str) -> Optional[dict]:
         return None
 
 
-def render_card(template: Optional[str], data: dict) -> str:
-    """卡片一律依 DATA_SAVE 實際收集到的欄位「照實排版」（每欄一行）。
+def _normalize_key(s: str) -> str:
+    """欄位名正規化：去空白、全形轉半形、統一小寫，供寬鬆比對用。"""
+    s = (s or "").strip().lower()
+    s = s.replace(" ", "").replace("\u3000", "")
+    s = s.replace("/", "").replace("／", "").replace("-", "").replace("_", "")
+    return s
 
-    這樣欄位名稱永遠對得上（跟著資料長），老闆不需要自己維護範本的
-    {佔位符} 拼字，避免名稱對不上導致卡片空白。
-    template 參數保留以相容呼叫端，目前不使用（方案 A）。
+
+def render_card(template: Optional[str], data: dict) -> str:
+    """把收集到的 data 排版成一張資料卡。
+
+    - 有設定範本：用範本的 {欄位} 佔位符填值。比對採「寬鬆比對」——
+      先精確比對，再用正規化後（去空白/斜線、全形半形、大小寫）比對，
+      降低老闆範本欄位名與 DATA_SAVE key 拼字不一致造成的空白。
+    - 保險絲：範本沒用到的已收集欄位，會自動補在卡片最後，資料不遺漏。
+    - 沒設定範本：直接每欄一行照實排版。
     """
+    if template and template.strip():
+        # 建正規化索引：normalized_key -> (原始key, 值)
+        norm_index = {_normalize_key(k): k for k in data}
+        used_keys: set = set()
+
+        def _sub(m):
+            ph = m.group(1).strip()
+            # 1) 精確比對
+            if ph in data:
+                used_keys.add(ph)
+                return str(data.get(ph, "")).strip()
+            # 2) 寬鬆比對
+            nk = _normalize_key(ph)
+            if nk in norm_index:
+                real = norm_index[nk]
+                used_keys.add(real)
+                return str(data.get(real, "")).strip()
+            return ""
+
+        rendered = re.sub(r"\{([^{}]+)\}", _sub, template).strip()
+
+        # 保險絲：補上範本沒涵蓋、但有值的欄位
+        leftover = [
+            f"{k}：{str(v).strip()}"
+            for k, v in data.items()
+            if k not in used_keys and str(v).strip()
+        ]
+        if leftover:
+            rendered = (rendered + "\n" + "\n".join(leftover)).strip() if rendered else "\n".join(leftover)
+        return rendered
+
+    # 無範本 → 照實排版
     return "\n".join(
         f"{k}：{str(v).strip()}"
         for k, v in data.items()
