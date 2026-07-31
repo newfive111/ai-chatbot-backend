@@ -9,7 +9,10 @@ from datetime import datetime, timezone, timedelta
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/calendar",
+]
 
 # 本機開發：讀 JSON 檔案
 # Railway 部署：讀 GOOGLE_CREDENTIALS_JSON_B64 環境變數（base64 編碼的 JSON 內容）
