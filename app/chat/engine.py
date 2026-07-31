@@ -131,7 +131,12 @@ CALENDAR_BOOKING_RULES = """
 【注意事項】
 - 不要自己猜測有沒有空，一定要呼叫工具確認
 - 若當天無空位，主動說「那天已滿，要不要看看其他日期？」
-- 客人說「明天」「下週一」等，請換算成正確的 YYYY-MM-DD 格式"""
+- 客人說「明天」「下週一」等，請「查上方【日期對照】表」換算成正確的 YYYY-MM-DD，絕對不要自己心算
+
+【日期一致性 - 最高優先】
+- 傳給 check_availability / book_appointment 的日期，必須和你「跟客人口頭講的日期、星期」完全一致，不可一個日期查、卻講成另一天。
+- 呼叫工具後，工具回傳結果裡會附上「正確的日期與星期」；跟客人確認或報告預約成功時，一律「照抄工具回傳的那個日期與星期」，絕對不要自己再重算或改寫成別天、別的星期。
+- 例如工具回傳「2026-08-04（星期二）」，你就只能說「8/4 星期二」，不可說成「8/5」或「星期三」。"""
 
 
 def _get_system_prompt(
@@ -303,6 +308,16 @@ def describe_image(api_key: str, image_bytes: bytes, mime_type: str = "image/jpe
     return ""
 
 
+def _weekday_of(date_str: str) -> str:
+    """把 YYYY-MM-DD 換成「星期X」，換算失敗回空字串。用來讓工具結果自帶正確星期。"""
+    from datetime import datetime
+    try:
+        names = ["一", "二", "三", "四", "五", "六", "日"]
+        return "星期" + names[datetime.strptime(date_str, "%Y-%m-%d").weekday()]
+    except Exception:
+        return ""
+
+
 def _call_ai_with_calendar(
     api_key: str,
     system_prompt: str,
@@ -392,10 +407,12 @@ def _call_ai_with_calendar(
                     slots = get_available_slots(
                         calendar_id, args["date"], slot_duration, business_hours
                     )
+                    wd = _weekday_of(args["date"])
+                    date_label = f"{args['date']}（{wd}）" if wd else args["date"]
                     if slots:
-                        result = f"{args['date']} 可預約時段：{', '.join(slots)}"
+                        result = f"{date_label} 可預約時段：{', '.join(slots)}。跟客人講日期時，務必用「{date_label}」這個完全相同的日期與星期，不要改成別天。"
                     else:
-                        result = f"{args['date']} 當天沒有可預約的時段（休假或已全滿）"
+                        result = f"{date_label} 當天沒有可預約的時段（休假或已全滿）"
 
                 elif fc.name == "book_appointment":
                     from app.calendar.client import create_booking
@@ -407,10 +424,12 @@ def _call_ai_with_calendar(
                     data  = create_booking(
                         calendar_id, title, args["date"], args["time"], slot_duration, desc
                     )
+                    wd = _weekday_of(args["date"])
+                    date_label = f"{args['date']}（{wd}）" if wd else args["date"]
                     if data.get("conflict"):
-                        result = f"{args['date']} {args['time']} 剛好被別人預約走了，請告訴客人這個時段已滿，並主動推薦其他還有空的時段。"
+                        result = f"{date_label} {args['time']} 剛好被別人預約走了，請告訴客人這個時段已滿，並主動推薦其他還有空的時段。"
                     else:
-                        result = f"預約成功！{args['date']} {args['time']}，{name} 的 {svc} 已登記。"
+                        result = f"預約成功！已登記於 {date_label} {args['time']}，{name} 的 {svc}。跟客人確認時，務必用「{date_label} {args['time']}」這個完全相同的日期、星期與時間，絕對不要改成別天或別的星期。"
                 else:
                     result = "未知工具"
 
