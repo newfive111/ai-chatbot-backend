@@ -404,9 +404,22 @@ def _call_ai_with_calendar(
                 system_instruction=system_prompt,
                 tools=[tools],
                 max_output_tokens=2048,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             )
         )
         candidate = response.candidates[0]
+
+        # 防護：Gemini 有時回傳沒有 parts 的 candidate（thinking 用光 token、
+        # 安全過濾等），直接 iterate 會 TypeError 造成 500。
+        if not candidate.content or not candidate.content.parts:
+            finish = getattr(candidate, "finish_reason", None)
+            logging.warning(f"[Calendar] empty candidate content, finish_reason={finish}")
+            if booking_data:
+                wd = _weekday_of(booking_data["預約日期"])
+                dl = f"{booking_data['預約日期']}（{wd}）" if wd else booking_data["預約日期"]
+                return f"✅ 預約成功！{dl} {booking_data['預約時間']} 已為您登記，期待您的光臨！", booking_data
+            return "不好意思，我剛剛恍神了一下 😅 方便再說一次嗎？", booking_data
+
         contents.append(candidate.content)
 
         fc_parts = [p for p in candidate.content.parts if p.function_call]
