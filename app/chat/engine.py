@@ -825,14 +825,28 @@ def generate_answer(
         data_saved = False
         if session_id:
             clean_reply, data_saved, saved_display_name, final_data = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
-            if data_saved:
+            # 完成訊號：AI 明確輸出 DATA_SAVE，或預約流程已成功在行事曆建立事件。
+            # 預約成功後 AI 常不會再輸出 DATA_SAVE，故 booking_data 也視為完成，
+            # 否則行事曆有訂到、後台客戶名單卻沒卡片。
+            completed = data_saved or bool(booking_data)
+            if completed:
                 session["status"] = "handed_off"
-                logging.info(f"[Engine] {session_id[:8]} → handed_off (DATA_SAVE)")
+                logging.info(f"[Engine] {session_id[:8]} → handed_off ({'DATA_SAVE' if data_saved else 'booking'})")
                 # 預約情境：以工具實際參數（固定鍵名）為準，避免 AI 的 DATA_SAVE 鍵名漂移
                 # 導致資料卡欄位對不上範本（出現空白行或重複行）。
                 card_data = booking_data if booking_data else final_data
                 if booking_data and not saved_display_name:
                     saved_display_name = booking_data.get("姓名") or saved_display_name
+                # 預約成功但 AI 沒輸出 DATA_SAVE → 補寫一筆到 Google Sheet（若有綁）
+                if booking_data and not data_saved and sheet_id:
+                    try:
+                        from app.sheets.client import upsert_row
+                        upsert_row(
+                            sheet_id, session_id, list(booking_data.keys()), booking_data,
+                            display_name=booking_data.get("姓名"), extra_fields=extra_sheet_fields,
+                        )
+                    except Exception as _e:
+                        logging.warning(f"[Sheet] booking upsert failed: {_e}")
                 # 存進客戶名單（後台可複製的資料卡）— 與 Google Sheet 無關，一律儲存
                 if card_data:
                     try:
@@ -861,7 +875,7 @@ def generate_answer(
 
         # 安全網：這則回覆被清成空字串（模型只吐了 marker，或回傳空 candidate），
         # 避免前端出現空白泡泡看起來像「當掉」；記錄原始回覆方便追蹤。
-        if not (clean_reply or "").strip() and not data_saved:
+        if not (clean_reply or "").strip() and not data_saved and not booking_data:
             logging.warning(f"[Engine] Empty reply after processing session={(session_id or '')[:8]} raw={raw_reply[:300]!r}")
             clean_reply = "不好意思，我剛剛恍神了一下 😅 方便再說一次嗎？"
 
