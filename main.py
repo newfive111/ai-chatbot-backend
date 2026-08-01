@@ -542,6 +542,54 @@ async def accept_invite(token: str, authorization: Optional[str] = Header(None))
     return {"ok": True, "org_id": org_id}
 
 
+# ── 團隊邀請碼（一組 6 碼、可重複用）：員工用 LINE 加管理助手 bot → 傳碼即加入團隊 ──
+# 與個人綁定碼（line_binding_codes，一次性、綁到特定 app_user）不同：
+# 這組碼綁在「團隊」上，讓多位員工各自成為獨立成員。
+
+def _gen_team_join_code(org_id: str, role: str, created_by: str) -> str:
+    import random
+    supabase.table("team_join_codes").delete().eq("org_id", org_id).execute()
+    for _ in range(8):
+        cand = f"{random.randint(0, 999999):06d}"
+        try:
+            supabase.table("team_join_codes").insert({
+                "code": cand, "org_id": org_id, "role": role, "created_by": created_by,
+            }).execute()
+            return cand
+        except Exception:
+            continue
+    raise HTTPException(500, "產生團隊邀請碼失敗，請重試")
+
+
+@app.get("/orgs/{org_id}/join-code")
+async def get_team_join_code(org_id: str, authorization: Optional[str] = Header(None)):
+    require_org_access(org_id, authorization, min_role="admin")
+    r = supabase.table("team_join_codes").select("code, role") \
+        .eq("org_id", org_id).limit(1).execute()
+    return r.data[0] if r.data else {"code": None}
+
+
+class CreateJoinCodeRequest(BaseModel):
+    role: str = "editor"
+
+
+@app.post("/orgs/{org_id}/join-code")
+async def create_team_join_code(org_id: str, body: CreateJoinCodeRequest,
+                                authorization: Optional[str] = Header(None)):
+    ctx = require_org_access(org_id, authorization, min_role="admin")
+    if body.role not in _VALID_ASSIGN_ROLES:
+        raise HTTPException(400, "無效的角色")
+    code = _gen_team_join_code(org_id, body.role, ctx["app_user"]["id"])
+    return {"code": code, "role": body.role}
+
+
+@app.delete("/orgs/{org_id}/join-code")
+async def revoke_team_join_code(org_id: str, authorization: Optional[str] = Header(None)):
+    require_org_access(org_id, authorization, min_role="admin")
+    supabase.table("team_join_codes").delete().eq("org_id", org_id).execute()
+    return {"ok": True}
+
+
 # ──────────────────────────────────────
 # Bot 管理
 # ──────────────────────────────────────
@@ -1927,6 +1975,37 @@ def _try_bind_staff(line_user_id: str, text: str) -> Optional[dict]:
     return au.data[0] if au.data else None
 
 
+def _try_join_team_by_code(line_user_id: str, text: str) -> Optional[dict]:
+    """用「團隊邀請碼」讓員工用 LINE 加入團隊並綁定：
+    從他的 LINE 身分建立/找到 app_user → 加進團隊 → 綁 staff_line。成功回 app_user。
+    這組碼可重複使用（不刪除），每位員工各自成為獨立成員。"""
+    import re
+    m = re.search(r"\d{6}", text)
+    if not m:
+        return None
+    code = m.group(0)
+    r = supabase.table("team_join_codes").select("*").eq("code", code).execute()
+    if not r.data:
+        return None
+    rec = r.data[0]
+    org_id = rec["org_id"]
+    role = rec.get("role") or "editor"
+    # 從 LINE 身分建立/找到員工的 app_user（沒有 supabase 帳號也可以，之後 LINE 登入會對上）
+    app_user = ensure_app_user(line_user_id=line_user_id)
+    app_user_id = app_user["id"]
+    # 加進團隊（已是成員就不動）
+    if get_membership_role(org_id, app_user_id) is None:
+        supabase.table("memberships").insert({
+            "org_id": org_id, "user_id": app_user_id, "role": role,
+        }).execute()
+    # 綁定管理助手
+    supabase.table("staff_line").upsert(
+        {"line_user_id": line_user_id, "app_user_id": app_user_id},
+        on_conflict="line_user_id",
+    ).execute()
+    return app_user
+
+
 def _pb(action: str, bot_id: str, uid: str) -> str:
     return _urlparse.urlencode({"a": action, "b": bot_id, "u": uid})
 
@@ -2191,8 +2270,10 @@ async def _handle_admin_event(event: dict):
         text = event["message"]["text"].strip()
 
         if not staff:
-            # 先試自動綁定（LINE 登入身分），再退回 6 碼綁定碼
-            bound = _autobind_staff_by_line(line_uid) or _try_bind_staff(line_uid, text)
+            # 先試自動綁定（LINE 登入身分），再試個人綁定碼，最後試團隊邀請碼
+            bound = (_autobind_staff_by_line(line_uid)
+                     or _try_bind_staff(line_uid, text)
+                     or _try_join_team_by_code(line_uid, text))
             if bound:
                 _admin_pending_name[line_uid] = True
                 await _admin_reply(reply_token, [_admin_text_msg(
