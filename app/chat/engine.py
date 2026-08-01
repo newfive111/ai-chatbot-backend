@@ -625,18 +625,38 @@ def render_card(template: Optional[str], data: dict) -> str:
     )
 
 
-def _save_submission(bot_id: str, session_id: str, data: dict, card_text: str, display_name: Optional[str]):
-    """把收集完成的一筆資料存進 submissions（後台客戶名單用）。失敗只 log。"""
+def _save_submission(bot_id: str, session_id: str, data: dict, card_text: str,
+                     display_name: Optional[str], status: str = "complete"):
+    """把資料存進 submissions（後台客戶名單用），依 session_id upsert（同一通對話只留一張卡）。
+    status='partial' 代表「收集中」（客戶還沒確認），='complete' 代表已完成。
+    已是 complete 的卡不會被 partial 覆蓋回收集中。失敗只 log。"""
     try:
         from app.chat.session_store import _sb
-        _sb.table("submissions").insert({
-            "bot_id": bot_id,
-            "session_id": session_id,
-            "display_name": display_name,
-            "data": data,
-            "card_text": card_text,
-        }).execute()
-        logging.info(f"[Submission] saved bot={bot_id} session={session_id[:8]}")
+        existing = _sb.table("submissions").select("id, status") \
+            .eq("bot_id", bot_id).eq("session_id", session_id) \
+            .order("created_at", desc=True).limit(1).execute()
+        row = existing.data[0] if existing.data else None
+        if row:
+            # 別把已完成的卡降級回收集中
+            if status == "partial" and row.get("status") == "complete":
+                return
+            _sb.table("submissions").update({
+                "display_name": display_name,
+                "data": data,
+                "card_text": card_text,
+                "status": status,
+            }).eq("id", row["id"]).execute()
+            logging.info(f"[Submission] updated bot={bot_id} session={session_id[:8]} status={status}")
+        else:
+            _sb.table("submissions").insert({
+                "bot_id": bot_id,
+                "session_id": session_id,
+                "display_name": display_name,
+                "data": data,
+                "card_text": card_text,
+                "status": status,
+            }).execute()
+            logging.info(f"[Submission] saved bot={bot_id} session={session_id[:8]} status={status}")
     except Exception as e:
         logging.warning(f"[Submission] save failed: {e}")
 
@@ -665,18 +685,19 @@ def _extract_and_save_data(
     sheet_id: str,
     session_id: str,
     extra_sheet_fields: Optional[dict] = None,
-) -> Tuple[str, bool, Optional[str], Optional[dict]]:
+) -> Tuple[str, bool, Optional[str], Optional[dict], Optional[dict]]:
     """
     偵測 AI 回覆中的資料標記，寫入 Google Sheet。
     - DATA_PARTIAL: {...} → 部分存檔，不觸發 handed_off
     - DATA_SAVE: {...}    → 完整存檔，觸發 handed_off（靜默）
     支援英文冒號與中文全形冒號，使用括號平衡法提取 JSON。
-    回傳 (清理後文字, 是否找到DATA_SAVE, display_name, DATA_SAVE資料dict)
+    回傳 (清理後文字, 是否找到DATA_SAVE, display_name, DATA_SAVE資料dict, DATA_PARTIAL資料dict)
     """
     cleaned = raw_reply
     found_final = False
     saved_display_name: Optional[str] = None
     final_data: Optional[dict] = None
+    partial_data: Optional[dict] = None
 
     def _strip_marker(text: str, result: tuple) -> str:
         """用精確位置移除 marker 段落，避免 regex 截斷問題。"""
@@ -694,6 +715,7 @@ def _extract_and_save_data(
     partial_result = _extract_json_object(raw_reply, marker="DATA_PARTIAL")
     if partial_result:
         _write_data_to_sheet(partial_result[0], sheet_id, session_id, "DATA_PARTIAL", extra_sheet_fields)
+        partial_data = _loads_lenient(partial_result[0])
         cleaned = _strip_marker(cleaned, partial_result)
 
     # ── 處理 DATA_SAVE（完整資料，觸發靜默）──
@@ -707,7 +729,7 @@ def _extract_and_save_data(
     if not partial_result and not final_result:
         logging.debug(f"[Engine] No data marker in reply (len={len(raw_reply)})")
 
-    return cleaned, found_final, saved_display_name, final_data
+    return cleaned, found_final, saved_display_name, final_data, partial_data
 
 
 def _generate_conversation_summary(api_key: str, history: list, last_question: str) -> str:
@@ -824,7 +846,7 @@ def generate_answer(
 
         data_saved = False
         if session_id:
-            clean_reply, data_saved, saved_display_name, final_data = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
+            clean_reply, data_saved, saved_display_name, final_data, partial_data = _extract_and_save_data(raw_reply, sheet_id, session_id, extra_sheet_fields=extra_sheet_fields)
             # 完成訊號：AI 明確輸出 DATA_SAVE，或預約流程已成功在行事曆建立事件。
             # 預約成功後 AI 常不會再輸出 DATA_SAVE，故 booking_data 也視為完成，
             # 否則行事曆有訂到、後台客戶名單卻沒卡片。
@@ -870,6 +892,18 @@ def generate_answer(
                 if _is_off_hours and off_hours_message:
                     clean_reply = clean_reply + "\n\n" + off_hours_message
                     logging.info(f"[Engine] Off-hours message appended after DATA_SAVE")
+            elif partial_data:
+                # 收集中：客戶還沒確認就把半成品存進客戶名單（標「收集中」），
+                # 避免客戶看到摘要以為結束、沒回「正確」就消失，導致整筆漏掉。
+                # 依 session_id upsert，之後客戶若真的確認，同一張卡會被覆蓋成「完成」。
+                try:
+                    card = render_card(card_template, partial_data)
+                    _save_submission(
+                        bot_id, session_id, partial_data, card,
+                        _get_display_name(partial_data), status="partial",
+                    )
+                except Exception as _e:
+                    logging.warning(f"[Submission] partial render/save failed: {_e}")
         else:
             clean_reply = re.sub(r'\n?DATA_(?:SAVE|PARTIAL):\s*\{.*?\}\n?', '', raw_reply, flags=re.DOTALL).strip()
 

@@ -3011,7 +3011,7 @@ async def list_submissions(
     """列出 bot 收集完成的客戶名單（DATA_SAVE 存下的資料卡，可複製）。"""
     require_bot_access(bot_id, authorization, min_role="viewer")
     query = supabase.table("submissions")\
-        .select("id, session_id, display_name, data, card_text, handled, created_at")\
+        .select("id, session_id, display_name, data, card_text, handled, status, created_at")\
         .eq("bot_id", bot_id)\
         .order("created_at", desc=True)
     if days > 0:
