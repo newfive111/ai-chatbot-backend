@@ -2269,11 +2269,21 @@ async def _handle_admin_event(event: dict):
     if etype == "message" and event.get("message", {}).get("type") == "text":
         text = event["message"]["text"].strip()
 
+        # 團隊邀請碼優先且獨立處理（放在 autobind 前，且不管是否已綁定）：
+        # 否則已用 LINE 登入過的員工會被 autobind 搶先，只綁了 staff_line 卻沒進團隊，
+        # 網頁登入就看不到 bot。此函式冪等，重複傳只會確保 membership 存在。
+        # 只有「不是正在代回客戶」時才攔截，避免代回內容剛好含 6 碼被誤判。
+        if not _admin_active_chat.get(line_uid):
+            joined = _try_join_team_by_code(line_uid, text)
+            if joined:
+                _admin_pending_name[line_uid] = True
+                await _admin_reply(reply_token, [_admin_text_msg(
+                    "✅ 已加入團隊！請問我該怎麼稱呼你？（直接回覆你的稱呼即可，例如：小明、王經理）")])
+                return
+
         if not staff:
-            # 先試自動綁定（LINE 登入身分），再試個人綁定碼，最後試團隊邀請碼
-            bound = (_autobind_staff_by_line(line_uid)
-                     or _try_bind_staff(line_uid, text)
-                     or _try_join_team_by_code(line_uid, text))
+            # 再試自動綁定（LINE 登入身分），再試個人綁定碼
+            bound = _autobind_staff_by_line(line_uid) or _try_bind_staff(line_uid, text)
             if bound:
                 _admin_pending_name[line_uid] = True
                 await _admin_reply(reply_token, [_admin_text_msg(
