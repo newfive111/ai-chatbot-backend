@@ -1038,6 +1038,10 @@ class UpdateBotRequest(BaseModel):
     observe_mode: Optional[bool] = None
     # 客戶名單資料卡排版範本（{欄位} 佔位符）
     card_template: Optional[str] = None
+    # 客戶單外送 webhook（打到合作方系統）
+    webhook_url: Optional[str] = None
+    webhook_secret: Optional[str] = None
+    webhook_enabled: Optional[bool] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -1097,6 +1101,27 @@ async def update_bot(
     if update_data:
         supabase.table("bots").update(update_data).eq("id", bot_id).execute()
     return {"message": "更新成功"}
+
+
+@app.post("/bots/{bot_id}/webhook/test")
+async def test_lead_webhook(bot_id: str, authorization: Optional[str] = Header(None)):
+    """送一筆測試客戶單到合作方 webhook，回傳對方的 HTTP 狀態碼與回應。"""
+    require_bot_access(bot_id, authorization, min_role="editor")
+    row = supabase.table("bots").select("webhook_url, webhook_secret").eq("id", bot_id).limit(1).execute()
+    cfg = row.data[0] if row.data else None
+    if not cfg or not cfg.get("webhook_url"):
+        raise HTTPException(status_code=400, detail="尚未設定 Webhook 網址，請先填好網址與金鑰並儲存")
+    from app.chat.engine import _build_lead_payload, _post_lead_webhook
+    import time as _t
+    from fastapi.concurrency import run_in_threadpool
+    payload = _build_lead_payload(
+        {"姓名": "測試客戶", "電話": "0900000000", "LINE ID": "testline", "用途": "這是一筆測試單，可忽略"},
+        "測試客戶", f"test-{int(_t.time())}", campaign="測試",
+    )
+    ok, code, text = await run_in_threadpool(
+        _post_lead_webhook, cfg["webhook_url"], cfg.get("webhook_secret") or "", payload
+    )
+    return {"ok": ok, "status_code": code, "response": (text or "")[:300]}
 
 
 @app.delete("/bots/{bot_id}")

@@ -673,6 +673,97 @@ def _save_submission(bot_id: str, session_id: str, data: dict, card_text: str,
         logging.warning(f"[Submission] save failed: {e}")
 
 
+def _lead_field(data: Optional[dict], keys: list) -> str:
+    """從收集到的資料 dict 依同義字清單取值（忽略大小寫與空白），取不到回空字串。"""
+    if not data:
+        return ""
+    norm = {str(k).strip().lower().replace(" ", "").replace("　", ""): v for k, v in data.items()}
+    for key in keys:
+        kk = key.lower().replace(" ", "")
+        if kk in norm and norm[kk] not in (None, ""):
+            return str(norm[kk])
+    return ""
+
+
+def _build_lead_payload(data: Optional[dict], display_name: Optional[str],
+                        session_id: str, campaign: str = "LINE") -> dict:
+    """把客戶卡整理成合作方要的攤平 JSON（欄位放最外層）。ref 用 session_id 供對方去重。"""
+    from datetime import datetime, timezone, timedelta
+    name = _lead_field(data, ["姓名", "名字", "稱呼", "客戶姓名", "name", "fullname"]) or (display_name or "")
+    phone = _lead_field(data, ["電話", "手機", "聯絡電話", "電話號碼", "手機號碼", "phone", "mobile", "tel"])
+    line_id = _lead_field(data, ["lineid", "line id", "line", "line帳號", "賴", "line_id"])
+    message = _lead_field(data, ["訊息", "message", "諮詢", "諮詢內容", "需求", "用途", "備註", "note"])
+    if not message:
+        amt = _lead_field(data, ["需求金額", "金額", "貸款金額"])
+        use = _lead_field(data, ["用途"])
+        message = "／".join(p for p in [(f"需求金額{amt}" if amt else ""), use] if p)
+    now_iso = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+    return {
+        "name": name,
+        "phone": phone,
+        "lineId": line_id,
+        "message": message,
+        "campaign": campaign,
+        "ref": session_id,
+        "time": now_iso,
+    }
+
+
+def _post_lead_webhook(url: str, secret: str, payload: dict) -> Tuple[bool, Optional[int], str]:
+    """POST 客戶單到合作方 webhook。回傳 (是否成功, HTTP狀態碼, 回應文字)。
+    200=收下(含 duplicated) 視為成功；400/403 不重試；連線錯誤/5xx 最多重試 3 次。"""
+    import httpx
+    import time as _time
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["X-Intake-Key"] = secret
+    last_code: Optional[int] = None
+    last_text = ""
+    for attempt in range(3):
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=10)
+            code = resp.status_code
+            text = (resp.text or "")[:300]
+            if code == 200:
+                logging.info(f"[Webhook] sent ref={str(payload.get('ref',''))[:12]} 200")
+                return True, 200, text
+            if code in (400, 403):
+                logging.warning(f"[Webhook] rejected {code}: {text}")
+                return False, code, text
+            last_code, last_text = code, text
+        except Exception as e:
+            last_text = str(e)
+            logging.warning(f"[Webhook] attempt {attempt+1} error: {e}")
+        _time.sleep(2 * (attempt + 1))
+    logging.warning(f"[Webhook] failed after retries code={last_code}")
+    return False, last_code, last_text
+
+
+def _dispatch_lead_webhook(bot_id: str, session_id: str, data: Optional[dict],
+                           display_name: Optional[str]):
+    """完成的客戶卡非同步（背景執行緒）打到合作方 webhook，不阻塞客戶回覆。
+    設定讀 bots.webhook_url / webhook_secret / webhook_enabled；沒電話的單不送（對方視為空白單）。"""
+    import threading
+
+    def _run():
+        try:
+            from app.chat.session_store import _sb
+            r = _sb.table("bots").select("webhook_url, webhook_secret, webhook_enabled") \
+                .eq("id", bot_id).limit(1).execute()
+            cfg = r.data[0] if r.data else None
+            if not cfg or not cfg.get("webhook_enabled") or not cfg.get("webhook_url"):
+                return
+            payload = _build_lead_payload(data, display_name, session_id)
+            if not payload.get("phone"):
+                logging.info(f"[Webhook] skip (no phone) session={session_id[:8]}")
+                return
+            _post_lead_webhook(cfg["webhook_url"], cfg.get("webhook_secret") or "", payload)
+        except Exception as e:
+            logging.warning(f"[Webhook] dispatch failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _write_data_to_sheet(json_str: str, sheet_id: str, session_id: str, marker: str, extra_sheet_fields: Optional[dict]) -> Optional[str]:
     """解析 JSON 並寫入 Sheet，失敗時只 log warning。回傳 display_name（或 None）。"""
     try:
@@ -888,6 +979,8 @@ def generate_answer(
                         _save_submission(bot_id, session_id, card_data, card, saved_display_name)
                     except Exception as _e:
                         logging.warning(f"[Submission] render/save failed: {_e}")
+                    # 完成的客戶單非同步打到合作方 webhook（有設定才送、不阻塞回覆）
+                    _dispatch_lead_webhook(bot_id, session_id, card_data, saved_display_name)
                 else:
                     logging.warning(f"[Submission] DATA_SAVE 觸發但資料為空，未存客戶名單 session={session_id[:8]}")
                 # 對話摘要：非同步補寫到試算表（僅在有綁 Sheet 時）
@@ -991,6 +1084,7 @@ def generate_answer(
                 else:
                     session["done"] = True
                     reply = "感謝您提供資料！我們已收到您的資訊，稍後會與您聯繫 😊\n\n如果還有其他問題，歡迎繼續詢問！"
+                    _dispatch_lead_webhook(bot_id, session_id, collected, _get_display_name(collected))
 
                 session["history"].append({"role": "user", "content": question})
                 session["history"].append({"role": "assistant", "content": reply})
