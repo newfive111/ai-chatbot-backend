@@ -686,19 +686,32 @@ def _lead_field(data: Optional[dict], keys: list) -> str:
 
 
 def _build_lead_payload(data: Optional[dict], display_name: Optional[str],
-                        session_id: str, campaign: str = "LINE") -> dict:
-    """把客戶卡整理成合作方要的攤平 JSON（欄位放最外層）。ref 用 session_id 供對方去重。"""
+                        session_id: str, campaign: str = "LINE",
+                        card_text: Optional[str] = None) -> dict:
+    """把客戶卡整理成合作方要的攤平 JSON（欄位放最外層）。ref 用 session_id 供對方去重。
+    除了對方文件定義的 name/phone/lineId/message，另把完整卡片放進 message，
+    並把所有收集到的結構化欄位（中文 key，對方可選用）一起攤平帶過去。"""
     from datetime import datetime, timezone, timedelta
     name = _lead_field(data, ["姓名", "名字", "稱呼", "客戶姓名", "name", "fullname"]) or (display_name or "")
     phone = _lead_field(data, ["電話", "手機", "聯絡電話", "電話號碼", "手機號碼", "phone", "mobile", "tel"])
     line_id = _lead_field(data, ["lineid", "line id", "line", "line帳號", "賴", "line_id"])
-    message = _lead_field(data, ["訊息", "message", "諮詢", "諮詢內容", "需求", "用途", "備註", "note"])
+    # message：優先用完整卡片文字（客戶要整張卡發過去），沒有才退回關鍵欄位摘要
+    message = (card_text or "").strip()
     if not message:
-        amt = _lead_field(data, ["需求金額", "金額", "貸款金額"])
-        use = _lead_field(data, ["用途"])
-        message = "／".join(p for p in [(f"需求金額{amt}" if amt else ""), use] if p)
+        message = _lead_field(data, ["訊息", "message", "諮詢", "諮詢內容", "需求", "用途", "備註", "note"])
+        if not message:
+            amt = _lead_field(data, ["需求金額", "金額", "貸款金額"])
+            use = _lead_field(data, ["用途"])
+            message = "／".join(p for p in [(f"需求金額{amt}" if amt else ""), use] if p)
     now_iso = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
-    return {
+    payload: dict = {}
+    # 先放所有原始結構化欄位（攤平在最外層，中文 key；對方文件說中英文都認）
+    for k, v in (data or {}).items():
+        key = str(k).strip()
+        if key and v not in (None, ""):
+            payload[key] = v
+    # 再放對方文件定義的標準英文欄位（覆蓋在最外層）
+    payload.update({
         "name": name,
         "phone": phone,
         "lineId": line_id,
@@ -706,7 +719,8 @@ def _build_lead_payload(data: Optional[dict], display_name: Optional[str],
         "campaign": campaign,
         "ref": session_id,
         "time": now_iso,
-    }
+    })
+    return payload
 
 
 def _post_lead_webhook(url: str, secret: str, payload: dict) -> Tuple[bool, Optional[int], str]:
@@ -740,7 +754,7 @@ def _post_lead_webhook(url: str, secret: str, payload: dict) -> Tuple[bool, Opti
 
 
 def _dispatch_lead_webhook(bot_id: str, session_id: str, data: Optional[dict],
-                           display_name: Optional[str]):
+                           display_name: Optional[str], card_text: Optional[str] = None):
     """完成的客戶卡非同步（背景執行緒）打到合作方 webhook，不阻塞客戶回覆。
     設定讀 bots.webhook_url / webhook_secret / webhook_enabled；沒電話的單不送（對方視為空白單）。"""
     import threading
@@ -753,7 +767,7 @@ def _dispatch_lead_webhook(bot_id: str, session_id: str, data: Optional[dict],
             cfg = r.data[0] if r.data else None
             if not cfg or not cfg.get("webhook_enabled") or not cfg.get("webhook_url"):
                 return
-            payload = _build_lead_payload(data, display_name, session_id)
+            payload = _build_lead_payload(data, display_name, session_id, card_text=card_text)
             if not payload.get("phone"):
                 logging.info(f"[Webhook] skip (no phone) session={session_id[:8]}")
                 return
@@ -974,13 +988,15 @@ def generate_answer(
                         logging.warning(f"[Sheet] booking upsert failed: {_e}")
                 # 存進客戶名單（後台可複製的資料卡）— 與 Google Sheet 無關，一律儲存
                 if card_data:
+                    card_rendered = None
                     try:
-                        card = render_card(card_template, card_data)
-                        _save_submission(bot_id, session_id, card_data, card, saved_display_name)
+                        card_rendered = render_card(card_template, card_data)
+                        _save_submission(bot_id, session_id, card_data, card_rendered, saved_display_name)
                     except Exception as _e:
                         logging.warning(f"[Submission] render/save failed: {_e}")
                     # 完成的客戶單非同步打到合作方 webhook（有設定才送、不阻塞回覆）
-                    _dispatch_lead_webhook(bot_id, session_id, card_data, saved_display_name)
+                    _dispatch_lead_webhook(bot_id, session_id, card_data, saved_display_name,
+                                           card_text=card_rendered)
                 else:
                     logging.warning(f"[Submission] DATA_SAVE 觸發但資料為空，未存客戶名單 session={session_id[:8]}")
                 # 對話摘要：非同步補寫到試算表（僅在有綁 Sheet 時）
