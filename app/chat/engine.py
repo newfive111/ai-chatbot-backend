@@ -686,7 +686,7 @@ def _lead_field(data: Optional[dict], keys: list) -> str:
 
 
 def _build_lead_payload(data: Optional[dict], display_name: Optional[str],
-                        session_id: str, campaign: str = "LINE",
+                        session_id: str, campaign: str = "LINE加好友",
                         card_text: Optional[str] = None) -> dict:
     """把客戶卡整理成合作方要的攤平 JSON（欄位放最外層）。ref 用 session_id 供對方去重。
     除了對方文件定義的 name/phone/lineId/message，另把完整卡片放進 message，
