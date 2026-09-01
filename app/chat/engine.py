@@ -705,11 +705,23 @@ def _build_lead_payload(data: Optional[dict], display_name: Optional[str],
             message = "／".join(p for p in [(f"需求金額{amt}" if amt else ""), use] if p)
     now_iso = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
     payload: dict = {}
-    # 先放所有原始結構化欄位（攤平在最外層，中文 key；對方文件說中英文都認）
-    for k, v in (data or {}).items():
-        key = str(k).strip()
-        if key and v not in (None, ""):
+    # 對方線索卡摘要只顯示最前面 2~3 欄，所以把最重要的欄位排前面，其餘保持原順序
+    _priority = ["需求金額", "地區", "工作", "用途"]
+    _items = [(str(k).strip(), v) for k, v in (data or {}).items()
+              if str(k).strip() and v not in (None, "")]
+    _norm = lambda s: s.replace(" ", "").lower()
+    _used: set = set()
+    for pk in _priority:
+        for key, v in _items:
+            if key not in _used and _norm(key) == _norm(pk):
+                payload[key] = v
+                _used.add(key)
+                break
+    # 再放其餘結構化欄位（攤平在最外層，中文 key；對方文件說中英文都認）
+    for key, v in _items:
+        if key not in _used:
             payload[key] = v
+            _used.add(key)
     # 再放對方文件定義的標準英文欄位（覆蓋在最外層）
     payload.update({
         "name": name,
