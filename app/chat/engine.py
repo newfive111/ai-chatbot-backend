@@ -259,13 +259,20 @@ def _get_system_prompt(
 # 主要 model + 後備 model。某些 Google 帳號/專案存取不到特定 model 會在
 # generateContent 回 404 NOT_FOUND（金鑰本身有效、也能列 model，就是這個 model 不給用），
 # 此時自動改用清單中下一個 model 重試，讓金鑰所屬專案有限制的老闆也能正常使用。
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+# 順序＝嘗試順序。2.5-flash 為主（多數現有金鑰可用、無額外延遲）；
+# 較新的 Google 帳號/專案已下架 2.5/2.0-flash、只給 3.6-flash，故 404 時自動接上 3.6-flash。
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-3.6-flash"]
 
 
 def _is_model_unavailable(err_str: str) -> bool:
     """判斷是否為「這個 model 該金鑰用不了」的錯誤（換別的 model 才有意義）。"""
     s = err_str.lower()
-    return ("404" in err_str and "not_found" in s) or "is not found" in s or "is not supported" in s
+    return (
+        ("404" in err_str and "not_found" in s)
+        or "is not found" in s
+        or "is not supported" in s
+        or "no longer available" in s
+    )
 
 
 def _generate_content_with_fallback(client, contents, config, preferred: Optional[str] = None):
