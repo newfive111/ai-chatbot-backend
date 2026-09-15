@@ -1316,6 +1316,12 @@ async def chat(bot_id: str, body: ChatRequest):
     except Exception as e:
         if "NO_API_KEY" in str(e):
             return {"answer": "⚠️ 尚未設定 Gemini API Key，請前往「⚙️ 設定」頁面填入後再試。"}
+        logging.exception(f"[Chat] generate failed bot={bot_id}: {e}")
+        # 後台測試對話（session_id 非 widget_/line_）把真正的錯誤帶回去方便排查；
+        # 正式 widget/line 流量維持籠統 500，不外洩內部錯誤。
+        _sid = body.session_id or ""
+        if not (_sid.startswith("widget_") or _sid.startswith("line_")):
+            return {"answer": f"⚠️ 產生回覆失敗（僅測試對話顯示）：{str(e)[:300]}"}
         raise
 
     # 只記錄真實流量（widget_ 或 line_ 開頭），排除測試對話
