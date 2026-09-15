@@ -14,7 +14,7 @@ import httpx
 
 from app.rag.processor import extract_text_from_pdf, chunk_text
 from app.rag.embeddings import store_chunks, search_similar_chunks
-from app.chat.engine import generate_answer, reset_session
+from app.chat.engine import generate_answer, reset_session, _generate_content_with_fallback
 from app.line.webhook import verify_line_signature, reply_line_message, push_line_message, download_line_content
 from app.auth.utils import create_token, decode_token, generate_bot_id
 from app.config import (
@@ -908,10 +908,10 @@ def _ai_persona_form(api_key: str, instruction: str) -> dict:
     last_err = None
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[types.Content(role="user", parts=[types.Part(text=instruction)])],
-                config=types.GenerateContentConfig(
+            response, _ = _generate_content_with_fallback(
+                client,
+                [types.Content(role="user", parts=[types.Part(text=instruction)])],
+                types.GenerateContentConfig(
                     max_output_tokens=1200,
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
                     response_mime_type="application/json",
@@ -2755,10 +2755,10 @@ async def ai_analysis(
         last_err = None
         for attempt in range(3):
             try:
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-                    config=types.GenerateContentConfig(
+                response, _ = _generate_content_with_fallback(
+                    client,
+                    [types.Content(role="user", parts=[types.Part(text=prompt)])],
+                    types.GenerateContentConfig(
                         max_output_tokens=6000,
                         thinking_config=types.ThinkingConfig(thinking_budget=0),
                     ),
@@ -2906,10 +2906,10 @@ async def style_analysis(
         last_err = None
         for attempt in range(3):
             try:
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-                    config=types.GenerateContentConfig(
+                response, _ = _generate_content_with_fallback(
+                    client,
+                    [types.Content(role="user", parts=[types.Part(text=prompt)])],
+                    types.GenerateContentConfig(
                         max_output_tokens=6000,
                         thinking_config=types.ThinkingConfig(thinking_budget=0),
                     ),

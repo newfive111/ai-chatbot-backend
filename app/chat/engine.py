@@ -256,6 +256,37 @@ def _get_system_prompt(
 # 模型呼叫（Gemini 2.5 Flash）
 # ──────────────────────────────────────
 
+# 主要 model + 後備 model。某些 Google 帳號/專案存取不到特定 model 會在
+# generateContent 回 404 NOT_FOUND（金鑰本身有效、也能列 model，就是這個 model 不給用），
+# 此時自動改用清單中下一個 model 重試，讓金鑰所屬專案有限制的老闆也能正常使用。
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+
+
+def _is_model_unavailable(err_str: str) -> bool:
+    """判斷是否為「這個 model 該金鑰用不了」的錯誤（換別的 model 才有意義）。"""
+    s = err_str.lower()
+    return ("404" in err_str and "not_found" in s) or "is not found" in s or "is not supported" in s
+
+
+def _generate_content_with_fallback(client, contents, config, preferred: Optional[str] = None):
+    """依 GEMINI_MODELS 順序呼叫 generate_content，遇到「model 用不了」的 404 時換下一個 model。
+    回傳 (response, 實際成功的 model)。preferred 有值時優先試它（工具迴圈第一次選定後沿用，
+    避免每一輪都先撞一次 404）。其他類型的錯誤照原樣往外拋。"""
+    models = GEMINI_MODELS if not preferred else [preferred] + [m for m in GEMINI_MODELS if m != preferred]
+    last_err = None
+    for i, model in enumerate(models):
+        try:
+            resp = client.models.generate_content(model=model, contents=contents, config=config)
+            return resp, model
+        except Exception as e:
+            if _is_model_unavailable(str(e)) and i < len(models) - 1:
+                logging.warning(f"[Gemini] model {model} 該金鑰無法使用，改用下一個 model 重試：{str(e)[:120]}")
+                last_err = e
+                continue
+            raise
+    raise last_err
+
+
 def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> str:
     """呼叫 Gemini 2.5 Flash（無工具版）"""
     from google import genai
@@ -273,10 +304,9 @@ def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> 
     last_err = None
     for _attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=contents,
-                config=types.GenerateContentConfig(
+            response, _ = _generate_content_with_fallback(
+                client, contents,
+                types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     max_output_tokens=2048,
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
@@ -311,15 +341,15 @@ def describe_image(api_key: str, image_bytes: bytes, mime_type: str = "image/jpe
     last_err = None
     for _attempt in range(2):
         try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
+            response, _ = _generate_content_with_fallback(
+                client,
+                [
                     types.Content(role="user", parts=[
                         types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                         types.Part(text=prompt),
                     ])
                 ],
-                config=types.GenerateContentConfig(
+                types.GenerateContentConfig(
                     max_output_tokens=1024,
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
@@ -408,16 +438,17 @@ def _call_ai_with_calendar(
     # 供後續產生「客戶名單資料卡」使用，避免仰賴 AI 自己取的 DATA_SAVE 鍵名（會漂）。
     booking_data: Optional[dict] = None
 
+    _model_used: Optional[str] = None
     for _ in range(6):
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(
+        response, _model_used = _generate_content_with_fallback(
+            client, contents,
+            types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 tools=[tools],
                 max_output_tokens=2048,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
-            )
+            ),
+            preferred=_model_used,
         )
         candidate = response.candidates[0]
 
