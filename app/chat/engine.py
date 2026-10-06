@@ -627,6 +627,44 @@ def _normalize_key(s: str) -> str:
     return s
 
 
+def _merge_collected(existing: Optional[dict], new: Optional[dict]) -> dict:
+    """把新一輪收集到的欄位併入既有累積資料；同欄位以「最新值」為準（客戶更正要覆蓋舊值），
+    空值不覆蓋。用正規化後的欄位名去重，避免「電話／電話 」這類拼法漂移產生重複鍵。
+    回傳的 dict 保留每個欄位最後一次出現的原始鍵名。"""
+    merged: dict = {}
+    norm_to_key: dict = {}
+    for src in (existing or {}, new or {}):
+        for k, v in (src or {}).items():
+            key = str(k).strip()
+            if not key or str(v).strip() == "":
+                continue
+            nk = _normalize_key(key)
+            if nk in norm_to_key:          # 同欄位 → 用最新的鍵名與值覆蓋
+                merged.pop(norm_to_key[nk], None)
+            norm_to_key[nk] = key
+            merged[key] = v
+    return merged
+
+
+def _format_collected_block(collected: Optional[dict]) -> str:
+    """把累積收集的資料組成要注入 system prompt 的權威區塊。
+    目的：長對話超過 history 上限後，早期欄位（電話/金額/薪資等）會被截斷，
+    模型看不到真值就會自己編造。把這些值獨立回灌，讓 DATA_SAVE 直接照抄不臆測。"""
+    if not collected:
+        return ""
+    lines = [f"- {k}：{str(v).strip()}" for k, v in collected.items() if str(v).strip()]
+    if not lines:
+        return ""
+    return (
+        "\n\n【本次對話已確認收集的資料（最高優先・以此為準）】\n"
+        "以下是客戶在這通對話中「真的講過」、系統已逐輪記錄的欄位值。\n"
+        "輸出 DATA_PARTIAL / DATA_SAVE 或列摘要時，這些欄位一律直接採用下列值、"
+        "逐字照抄（尤其電話、LINE ID、金額等數字，絕對不可改動或憑記憶重打）。\n"
+        "只有當客戶在最新訊息中明確更正某欄位時，才以新值取代。\n"
+        + "\n".join(lines)
+    )
+
+
 def render_card(template: Optional[str], data: dict) -> str:
     """把收集到的 data 排版成一張資料卡。
 
@@ -997,6 +1035,11 @@ def generate_answer(
                 logging.info(f"[Engine] {session_id[:8]} handed_off → silent")
                 return ""
             history = session.get("history", [])
+            # 把先前累積的收集資料回灌進 system prompt，避免長對話把早期欄位
+            # （電話/金額/薪資）擠出 history 後，模型在 DATA_SAVE 時憑空編造。
+            _collected_block = _format_collected_block(session.get("collected_data"))
+            if _collected_block:
+                system_prompt = system_prompt + _collected_block
         else:
             session = None
             history = []
@@ -1089,6 +1132,16 @@ def generate_answer(
                 {"role": "user", "content": question},
                 {"role": "assistant", "content": clean_reply},
             ]
+            # 累積本輪收集到的欄位（partial 先、final 後，後者覆蓋），下一輪回灌給模型。
+            _new_fields = {}
+            if partial_data:
+                _new_fields.update(partial_data)
+            if final_data:
+                _new_fields.update(final_data)
+            if _new_fields:
+                session["collected_data"] = _merge_collected(
+                    session.get("collected_data"), _new_fields
+                )
             session_store.save(session_id, session)
 
         return clean_reply

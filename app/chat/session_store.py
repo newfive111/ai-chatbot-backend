@@ -30,7 +30,8 @@ _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 # write-through memory cache
 _cache: dict = {}
 
-MAX_HISTORY = 40          # 最多保留 40 則（20 輪對話），超過自動截斷
+MAX_HISTORY = 60          # 最多保留 60 則（30 輪對話），超過自動截斷。
+                          # 已收集欄位另存 session["collected_data"] 回灌，不靠 history 記住真值。
 TTL_DAYS    = 3           # session 超過 3 天沒互動 → 自動過期
 
 
