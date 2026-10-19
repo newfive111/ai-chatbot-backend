@@ -761,9 +761,27 @@ def _lead_field(data: Optional[dict], keys: list) -> str:
     return ""
 
 
+def _format_transcript(history: Optional[list], max_chars: int = 8000) -> str:
+    """把對話歷史組成可讀的問答紀錄（客戶／客服 逐則）。
+    供合作方參考客戶諮詢全貌。過長時保留最後 max_chars（結尾通常是最新、最關鍵的對話）。"""
+    if not history:
+        return ""
+    lines = []
+    for m in history or []:
+        role = "客戶" if m.get("role") == "user" else "客服"
+        content = str(m.get("content", "")).strip()
+        if content:
+            lines.append(f"{role}：{content}")
+    text = "\n".join(lines).strip()
+    if len(text) > max_chars:
+        text = "…(前略)\n" + text[-max_chars:]
+    return text
+
+
 def _build_lead_payload(data: Optional[dict], display_name: Optional[str],
                         session_id: str, campaign: str = "LINE加好友",
-                        card_text: Optional[str] = None) -> dict:
+                        card_text: Optional[str] = None,
+                        transcript: Optional[str] = None) -> dict:
     """把客戶卡整理成合作方要的攤平 JSON（欄位放最外層）。ref 用 session_id 供對方去重。
     除了對方文件定義的 name/phone/lineId/message，另把完整卡片放進 message，
     並把所有收集到的結構化欄位（中文 key，對方可選用）一起攤平帶過去。"""
@@ -798,6 +816,9 @@ def _build_lead_payload(data: Optional[dict], display_name: Optional[str],
         if key not in _used:
             payload[key] = v
             _used.add(key)
+    # 完整問答紀錄（放在結構化欄位之後、標準欄位之前，不會擠到卡片摘要前幾欄）
+    if transcript and transcript.strip():
+        payload["conversation"] = transcript.strip()
     # 再放對方文件定義的標準英文欄位（覆蓋在最外層）
     payload.update({
         "name": name,
@@ -855,7 +876,15 @@ def _dispatch_lead_webhook(bot_id: str, session_id: str, data: Optional[dict],
             cfg = r.data[0] if r.data else None
             if not cfg or not cfg.get("webhook_enabled") or not cfg.get("webhook_url"):
                 return
-            payload = _build_lead_payload(data, display_name, session_id, card_text=card_text)
+            # 一併帶上整段問答紀錄（自動回覆的對話），供合作方參考
+            transcript = ""
+            try:
+                _sess = session_store.get_session(session_id)
+                transcript = _format_transcript((_sess or {}).get("history"))
+            except Exception as _te:
+                logging.warning(f"[Webhook] transcript build failed: {_te}")
+            payload = _build_lead_payload(data, display_name, session_id,
+                                          card_text=card_text, transcript=transcript)
             if not payload.get("phone"):
                 logging.info(f"[Webhook] skip (no phone) session={session_id[:8]}")
                 return
