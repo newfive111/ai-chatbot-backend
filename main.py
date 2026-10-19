@@ -1042,6 +1042,7 @@ class UpdateBotRequest(BaseModel):
     webhook_url: Optional[str] = None
     webhook_secret: Optional[str] = None
     webhook_enabled: Optional[bool] = None
+    webhook_send_conversation: Optional[bool] = None   # 是否一併送出整段問答紀錄
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(

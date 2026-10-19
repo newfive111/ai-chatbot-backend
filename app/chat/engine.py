@@ -871,18 +871,22 @@ def _dispatch_lead_webhook(bot_id: str, session_id: str, data: Optional[dict],
     def _run():
         try:
             from app.chat.session_store import _sb
-            r = _sb.table("bots").select("webhook_url, webhook_secret, webhook_enabled") \
-                .eq("id", bot_id).limit(1).execute()
+            r = _sb.table("bots").select(
+                "webhook_url, webhook_secret, webhook_enabled, webhook_send_conversation"
+            ).eq("id", bot_id).limit(1).execute()
             cfg = r.data[0] if r.data else None
             if not cfg or not cfg.get("webhook_enabled") or not cfg.get("webhook_url"):
                 return
-            # 一併帶上整段問答紀錄（自動回覆的對話），供合作方參考
+            # 一併帶上整段問答紀錄（自動回覆的對話），供合作方參考。
+            # webhook_send_conversation：None/缺（舊資料）視為開，明確 False 才不送。
             transcript = ""
-            try:
-                _sess = session_store.get_session(session_id)
-                transcript = _format_transcript((_sess or {}).get("history"))
-            except Exception as _te:
-                logging.warning(f"[Webhook] transcript build failed: {_te}")
+            _send_conv = cfg.get("webhook_send_conversation")
+            if _send_conv is None or _send_conv:
+                try:
+                    _sess = session_store.get_session(session_id)
+                    transcript = _format_transcript((_sess or {}).get("history"))
+                except Exception as _te:
+                    logging.warning(f"[Webhook] transcript build failed: {_te}")
             payload = _build_lead_payload(data, display_name, session_id,
                                           card_text=card_text, transcript=transcript)
             if not payload.get("phone"):
