@@ -1114,9 +1114,18 @@ async def test_lead_webhook(bot_id: str, authorization: Optional[str] = Header(N
     from app.chat.engine import _build_lead_payload, _post_lead_webhook
     import time as _t
     from fastapi.concurrency import run_in_threadpool
+    _sample_transcript = (
+        "客戶：你好，我想了解一下\n"
+        "客服：哈囉您好！請問怎麼稱呼呢？\n"
+        "客戶：我姓王，電話0900000000\n"
+        "客服：好的王先生，請問這次主要想處理什麼需求呢？\n"
+        "客戶：資金週轉\n"
+        "客服：好的，資料收到了，稍後會有專員與您聯繫（這是一筆測試單，可忽略）"
+    )
     payload = _build_lead_payload(
         {"姓名": "測試客戶", "電話": "0900000000", "LINE ID": "testline", "用途": "這是一筆測試單，可忽略"},
         "測試客戶", f"test-{int(_t.time())}", campaign="測試",
+        transcript=_sample_transcript,
     )
     ok, code, text = await run_in_threadpool(
         _post_lead_webhook, cfg["webhook_url"], cfg.get("webhook_secret") or "", payload
