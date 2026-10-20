@@ -871,9 +871,16 @@ def _dispatch_lead_webhook(bot_id: str, session_id: str, data: Optional[dict],
     def _run():
         try:
             from app.chat.session_store import _sb
-            r = _sb.table("bots").select(
-                "webhook_url, webhook_secret, webhook_enabled, webhook_send_conversation"
-            ).eq("id", bot_id).limit(1).execute()
+            try:
+                r = _sb.table("bots").select(
+                    "webhook_url, webhook_secret, webhook_enabled, webhook_send_conversation"
+                ).eq("id", bot_id).limit(1).execute()
+            except Exception:
+                # webhook_send_conversation 欄位尚未建立（舊 schema）→ 退回不含該欄位的查詢，
+                # 避免整個送單靜默失敗；此時 conversation 預設照送。
+                r = _sb.table("bots").select(
+                    "webhook_url, webhook_secret, webhook_enabled"
+                ).eq("id", bot_id).limit(1).execute()
             cfg = r.data[0] if r.data else None
             if not cfg or not cfg.get("webhook_enabled") or not cfg.get("webhook_url"):
                 return

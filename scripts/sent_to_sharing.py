@@ -77,11 +77,18 @@ def main():
         label = f"今天（{now_tw:%Y-%m-%d}）"
     since_utc = start.astimezone(timezone.utc).isoformat()
 
-    # 1) 有開 webhook 的 bot
-    bq = sb.table("bots").select("id, name, webhook_enabled, webhook_send_conversation")
-    if args.bot:
-        bq = bq.eq("id", args.bot)
-    bots = {b["id"]: b for b in (bq.execute().data or []) if b.get("webhook_enabled")}
+    # 1) 有開 webhook 的 bot（webhook_send_conversation 欄位可能尚未建立，退回不含它的查詢）
+    def _fetch_bots(cols: str):
+        q = sb.table("bots").select(cols)
+        if args.bot:
+            q = q.eq("id", args.bot)
+        return q.execute().data or []
+
+    try:
+        rows = _fetch_bots("id, name, webhook_enabled, webhook_send_conversation")
+    except Exception:
+        rows = _fetch_bots("id, name, webhook_enabled")
+    bots = {b["id"]: b for b in rows if b.get("webhook_enabled")}
 
     print(f"發去 Sharing 的客戶資料 · {label}")
     print(f"有開 webhook 的 bot：{len(bots)} 台")
