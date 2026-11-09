@@ -256,12 +256,12 @@ def _get_system_prompt(
 # 模型呼叫（Gemini 2.5 Flash）
 # ──────────────────────────────────────
 
-# 主要 model + 後備 model。某些 Google 帳號/專案存取不到特定 model 會在
-# generateContent 回 404 NOT_FOUND（金鑰本身有效、也能列 model，就是這個 model 不給用），
-# 此時自動改用清單中下一個 model 重試，讓金鑰所屬專案有限制的老闆也能正常使用。
-# 順序＝嘗試順序。2.5-flash 為主（多數現有金鑰可用、無額外延遲）；
-# 較新的 Google 帳號/專案已下架 2.5/2.0-flash、只給 3.6-flash，故 404 時自動接上 3.6-flash。
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-3.6-flash"]
+# 主要 model + 後備 model。Google 會不定期下架舊 model（generateContent 回 404
+# NOT_FOUND），某些帳號/專案也只給得到特定 model；清單中某個不行就自動換下一個重試。
+# 順序＝嘗試順序，最前面放現行主力。Google flash 汰換很快，壞掉時更新這一行即可。
+# 更新紀錄：2026-06 下架 2.0-flash；2026-11 下架 3.6-flash、2.5-flash 退役中
+# （現行為 gemini-3.8-flash / gemini-3.5-flash-lite）。
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
 
 
 def _is_model_unavailable(err_str: str) -> bool:
