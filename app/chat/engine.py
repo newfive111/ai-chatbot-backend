@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from typing import List, Optional, Tuple
 
@@ -263,6 +264,14 @@ def _get_system_prompt(
 # （現行為 gemini-3.8-flash / gemini-3.5-flash-lite）。
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
 
+# 客戶 bot 生成供應商：
+#   "claude" = 平台付費 Claude Haiku（PLATFORM_ANTHROPIC_KEY，租戶不用設金鑰）
+#   "gemini" = 舊行為（租戶自帶 Gemini 金鑰）
+# 預設先維持 gemini（部署當下零變動）；確認 Claude 無誤後，在 Railway 設環境變數
+# CUSTOMER_BOT_PROVIDER=claude 切換，有狀況改回 gemini 即可即時回滾。
+CUSTOMER_BOT_PROVIDER = os.getenv("CUSTOMER_BOT_PROVIDER", "gemini").strip().lower()
+CUSTOMER_BOT_MODEL = os.getenv("CUSTOMER_BOT_MODEL", "claude-haiku-5-5").strip()
+
 
 def _is_model_unavailable(err_str: str) -> bool:
     """判斷是否為「這個 model 該金鑰用不了」的錯誤（換別的 model 才有意義）。"""
@@ -294,8 +303,68 @@ def _generate_content_with_fallback(client, contents, config, preferred: Optiona
     raise last_err
 
 
+def _claude_client():
+    """建立平台付費的 Anthropic client（客戶 bot 用）。"""
+    import anthropic
+    from app.config import PLATFORM_ANTHROPIC_KEY
+    return anthropic.Anthropic(api_key=PLATFORM_ANTHROPIC_KEY)
+
+
+def _history_to_claude_messages(history: list, question: str) -> list:
+    """把對話歷史轉成 Claude messages；確保第一則是 user（Claude 硬性要求）。"""
+    messages = []
+    for msg in history:
+        role = "assistant" if msg.get("role") == "assistant" else "user"
+        messages.append({"role": role, "content": str(msg.get("content", ""))})
+    # 開頭若是 assistant（例如歡迎語），丟掉以符合 Claude「第一則必須 user」
+    while messages and messages[0]["role"] == "assistant":
+        messages.pop(0)
+    messages.append({"role": "user", "content": question})
+    return messages
+
+
+def _claude_text(resp) -> str:
+    """取出 Claude 回覆裡的純文字（略過 thinking/tool_use 區塊）。"""
+    return "".join(
+        b.text for b in resp.content if getattr(b, "type", None) == "text"
+    ).strip()
+
+
 def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> str:
-    """呼叫 Gemini 2.5 Flash（無工具版）"""
+    """客戶 bot 一般對話生成。依 CUSTOMER_BOT_PROVIDER 走 Claude 或 Gemini。"""
+    if CUSTOMER_BOT_PROVIDER == "claude":
+        return _call_ai_claude(system_prompt, history, question)
+    return _call_ai_gemini(api_key, system_prompt, history, question)
+
+
+def _call_ai_claude(system_prompt: str, history: list, question: str) -> str:
+    """用平台 Claude Haiku 生成（無工具版）。"""
+    import time as _time
+    client = _claude_client()
+    messages = _history_to_claude_messages(history, question)
+    last_err = None
+    for _attempt in range(3):
+        try:
+            resp = client.messages.create(
+                model=CUSTOMER_BOT_MODEL,
+                max_tokens=2048,
+                temperature=0.7,
+                system=system_prompt,
+                messages=messages,
+            )
+            return _claude_text(resp)
+        except Exception as e:
+            last_err = e
+            es = str(e).lower()
+            if "overloaded" in es or "529" in es or "rate" in es or "503" in es:
+                _time.sleep(3 * (_attempt + 1))
+            else:
+                raise
+    raise last_err
+
+
+def _call_ai_gemini(api_key: str, system_prompt: str, history: list, question: str) -> str:
+    """呼叫 Gemini（無工具版）"""
     from google import genai
     from google.genai import types
 
@@ -333,17 +402,55 @@ def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> 
     raise last_err
 
 
+_VISION_PROMPT = (
+    "請用繁體中文描述這張圖片的內容。"
+    "若圖片中有任何文字（例如證件、單據、螢幕截圖、表格），請完整、逐字列出所有文字，不要遺漏數字。"
+    "只描述你實際看到的內容，看不清楚的地方就說看不清楚，不要臆測。"
+)
+
+
 def describe_image(api_key: str, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
-    """用 Gemini 2.5 Flash 讀圖：輸出圖片內容描述 + 完整 OCR 文字。失敗回空字串。"""
+    """讀圖：輸出圖片內容描述 + 完整 OCR 文字。失敗回空字串。依 provider 走 Claude 或 Gemini。"""
+    if CUSTOMER_BOT_PROVIDER == "claude":
+        return _describe_image_claude(image_bytes, mime_type)
+    return _describe_image_gemini(api_key, image_bytes, mime_type)
+
+
+def _describe_image_claude(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+    """用平台 Claude Haiku 讀圖。"""
+    import base64
+    # Claude 只接受 jpeg/png/gif/webp，其他一律當 jpeg 處理
+    if mime_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+        mime_type = "image/jpeg"
+    try:
+        client = _claude_client()
+        resp = client.messages.create(
+            model=CUSTOMER_BOT_MODEL,
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": mime_type,
+                        "data": base64.standard_b64encode(image_bytes).decode("utf-8"),
+                    }},
+                    {"type": "text", "text": _VISION_PROMPT},
+                ],
+            }],
+        )
+        return _claude_text(resp)
+    except Exception as e:
+        logging.warning(f"[Vision] describe_image(claude) failed: {e}")
+        return ""
+
+
+def _describe_image_gemini(api_key: str, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+    """用 Gemini 讀圖：輸出圖片內容描述 + 完整 OCR 文字。失敗回空字串。"""
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    prompt = (
-        "請用繁體中文描述這張圖片的內容。"
-        "若圖片中有任何文字（例如證件、單據、螢幕截圖、表格），請完整、逐字列出所有文字，不要遺漏數字。"
-        "只描述你實際看到的內容，看不清楚的地方就說看不清楚，不要臆測。"
-    )
+    prompt = _VISION_PROMPT
     import time as _time
     last_err = None
     for _attempt in range(2):
@@ -384,7 +491,129 @@ def _weekday_of(date_str: str) -> str:
         return ""
 
 
-def _call_ai_with_calendar(
+def _run_calendar_tool(name: str, args: dict, calendar_id: str,
+                       slot_duration: int, business_hours: dict):
+    """執行預約工具，回傳 (給模型看的結果字串, booking_data或None)。供 Claude tool-use 版使用。"""
+    booking_data = None
+    try:
+        if name == "check_availability":
+            from app.calendar.client import get_available_slots
+            slots = get_available_slots(calendar_id, args["date"], slot_duration, business_hours)
+            wd = _weekday_of(args["date"])
+            date_label = f"{args['date']}（{wd}）" if wd else args["date"]
+            if slots:
+                result = f"{date_label} 可預約時段：{', '.join(slots)}。跟客人講日期時，務必用「{date_label}」這個完全相同的日期與星期，不要改成別天。"
+            else:
+                result = f"{date_label} 當天沒有可預約的時段（休假或已全滿）"
+        elif name == "book_appointment":
+            from app.calendar.client import create_booking
+            svc   = args.get("service", "預約")
+            cname = args.get("customer_name", "客人")
+            phone = args.get("customer_phone", "")
+            title = f"{cname} - {svc}"
+            desc  = f"姓名：{cname}\n電話：{phone}\n服務：{svc}"
+            data  = create_booking(calendar_id, title, args["date"], args["time"], slot_duration, desc)
+            wd = _weekday_of(args["date"])
+            date_label = f"{args['date']}（{wd}）" if wd else args["date"]
+            if data.get("conflict"):
+                result = f"{date_label} {args['time']} 剛好被別人預約走了，請告訴客人這個時段已滿，並主動推薦其他還有空的時段。"
+            else:
+                result = f"預約成功！已登記於 {date_label} {args['time']}，{cname} 的 {svc}。跟客人確認時，務必用「{date_label} {args['time']}」這個完全相同的日期、星期與時間，絕對不要改成別天或別的星期。"
+                booking_data = {
+                    "姓名": cname, "電話": phone, "服務項目": svc,
+                    "預約日期": args["date"], "預約時間": args["time"],
+                }
+        else:
+            result = "未知工具"
+    except Exception as e:
+        result = f"操作失敗：{str(e)[:80]}"
+    return result, booking_data
+
+
+def _call_ai_with_calendar(api_key, system_prompt, history, question,
+                           calendar_id, slot_duration, business_hours):
+    """含預約的對話生成。依 CUSTOMER_BOT_PROVIDER 走 Claude 或 Gemini。回傳 (text, booking_data)。"""
+    if CUSTOMER_BOT_PROVIDER == "claude":
+        return _call_ai_with_calendar_claude(
+            system_prompt, history, question, calendar_id, slot_duration, business_hours)
+    return _call_ai_with_calendar_gemini(
+        api_key, system_prompt, history, question, calendar_id, slot_duration, business_hours)
+
+
+def _call_ai_with_calendar_claude(system_prompt, history, question,
+                                  calendar_id, slot_duration, business_hours):
+    """用平台 Claude（Anthropic Tool Use）處理含預約的對話。回傳 (text, booking_data)。"""
+    import time as _time
+    from datetime import datetime, timezone, timedelta
+    today_tw = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    client = _claude_client()
+    tools = [
+        {
+            "name": "check_availability",
+            "description": "查詢指定日期的可預約時段，詢問客人想預約哪天後立刻呼叫此工具",
+            "input_schema": {
+                "type": "object",
+                "properties": {"date": {"type": "string", "description": f"日期，格式 YYYY-MM-DD，今天是 {today_tw}"}},
+                "required": ["date"],
+            },
+        },
+        {
+            "name": "book_appointment",
+            "description": "確認預約，在行事曆建立事件。客人確認日期、時間、姓名、電話後呼叫",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "date":           {"type": "string", "description": "日期 YYYY-MM-DD"},
+                    "time":           {"type": "string", "description": "時間 HH:MM"},
+                    "customer_name":  {"type": "string", "description": "客人姓名"},
+                    "customer_phone": {"type": "string", "description": "客人電話"},
+                    "service":        {"type": "string", "description": "服務項目，例如：剪髮、染髮"},
+                },
+                "required": ["date", "time", "customer_name", "customer_phone"],
+            },
+        },
+    ]
+    messages = _history_to_claude_messages(history, question)
+    booking_data = None
+    for _ in range(6):
+        resp = None
+        last_err = None
+        for _attempt in range(3):
+            try:
+                resp = client.messages.create(
+                    model=CUSTOMER_BOT_MODEL, max_tokens=2048, temperature=0.7,
+                    system=system_prompt, tools=tools, messages=messages,
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                es = str(e).lower()
+                if "overloaded" in es or "529" in es or "rate" in es or "503" in es:
+                    _time.sleep(3 * (_attempt + 1))
+                else:
+                    break
+        if last_err is not None:
+            raise last_err
+
+        messages.append({"role": "assistant", "content": resp.content})
+        tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
+        if resp.stop_reason == "tool_use" and tool_uses:
+            tool_results = []
+            for tu in tool_uses:
+                args = dict(tu.input) if tu.input else {}
+                result, bd = _run_calendar_tool(tu.name, args, calendar_id, slot_duration, business_hours)
+                if bd:
+                    booking_data = bd
+                logging.info(f"[Calendar/Claude] {tu.name} → {result[:80]}")
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
+            messages.append({"role": "user", "content": tool_results})
+            continue
+        return (_claude_text(resp) or "處理完成"), booking_data
+    return "處理超時，請再試一次。", booking_data
+
+
+def _call_ai_with_calendar_gemini(
     api_key: str,
     system_prompt: str,
     history: list,
@@ -1030,7 +1259,12 @@ def generate_answer(
     # 客戶名單資料卡排版範本（{欄位} 佔位符）
     card_template: Optional[str] = None,
 ) -> str:
-    if not api_key:
+    # Claude 模式用平台金鑰、不需租戶 Gemini key；Gemini 模式才需要租戶 key。
+    if CUSTOMER_BOT_PROVIDER == "claude":
+        from app.config import PLATFORM_ANTHROPIC_KEY
+        if not PLATFORM_ANTHROPIC_KEY:
+            raise Exception("NO_API_KEY")
+    elif not api_key:
         raise Exception("NO_API_KEY")
 
     # ── 下班時間判斷（供後段使用）──
