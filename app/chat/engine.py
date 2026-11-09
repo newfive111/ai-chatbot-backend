@@ -155,7 +155,10 @@ def _get_system_prompt(
     collect_fields: Optional[List[str]] = None,
 ) -> str:
     """
-    組合最終 system prompt：[角色設定] + [知識庫] + [預約規則?] + [平台底層規則]
+    組合 system prompt，回傳 (穩定段, 變動段) 兩塊：
+      穩定段 = 角色設定 + 預約規則? + 平台底層規則 + 固定鍵名（每台 bot 固定）
+      變動段 = 目前時間 + 知識庫檢索（每輪會變）
+    穩定段排前面供 Claude prompt caching 快取；Gemini 則直接串成一整段。
     """
     from datetime import datetime, timezone, timedelta
     TW = timezone(timedelta(hours=8))
@@ -250,7 +253,12 @@ def _get_system_prompt(
                 "若有清單以外的額外資訊，可自行取名照常放入，但清單內的欄位務必用上面的固定名稱。"
             )
 
-    return f"{role_section}{date_info}{kb_section}{calendar_section}{rules}{fixed_keys}"
+    # 為了 Claude prompt caching：把「每台 bot 固定、每輪都一樣」的內容放前面當
+    # 可快取前綴（角色＋預約規則＋平台規則＋固定鍵名），把「每輪會變」的內容
+    # （目前時間、知識庫檢索結果）放後面。回傳 (穩定段, 變動段)。
+    stable = f"{role_section}{calendar_section}{rules}{fixed_keys}"
+    volatile = f"{date_info}{kb_section}"
+    return stable, volatile
 
 
 # ──────────────────────────────────────
@@ -330,6 +338,39 @@ def _claude_text(resp) -> str:
     ).strip()
 
 
+def _sys_parts(system_prompt):
+    """system_prompt 可能是 (穩定段, 變動段) tuple，或舊式單一字串。統一取出兩段。"""
+    if isinstance(system_prompt, (tuple, list)):
+        stable = system_prompt[0] if len(system_prompt) > 0 else ""
+        volatile = system_prompt[1] if len(system_prompt) > 1 else ""
+        return str(stable or ""), str(volatile or "")
+    return str(system_prompt or ""), ""
+
+
+def _sys_str(system_prompt) -> str:
+    """給 Gemini 用：把兩段串成一整段 system instruction。"""
+    stable, volatile = _sys_parts(system_prompt)
+    return stable + volatile
+
+
+def _claude_system_blocks(system_prompt) -> list:
+    """給 Claude 用：穩定段掛 cache_control（prompt caching），變動段不快取。
+
+    穩定段＝角色＋平台規則＋預約規則＋固定鍵名，每台 bot 每輪都一樣，
+    還能跨客戶共用快取；變動段＝時間＋知識庫＋已收集資料，每輪會變放後面。
+    claude-haiku-5-5 最低快取門檻 512 token，穩定段通常都超過。
+    """
+    stable, volatile = _sys_parts(system_prompt)
+    blocks = [{
+        "type": "text",
+        "text": stable,
+        "cache_control": {"type": "ephemeral"},
+    }]
+    if volatile.strip():
+        blocks.append({"type": "text", "text": volatile})
+    return blocks
+
+
 def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> str:
     """客戶 bot 一般對話生成。依 CUSTOMER_BOT_PROVIDER 走 Claude 或 Gemini。"""
     if CUSTOMER_BOT_PROVIDER == "claude":
@@ -348,7 +389,7 @@ def _call_ai_claude(system_prompt: str, history: list, question: str) -> str:
             resp = client.messages.create(
                 model=CUSTOMER_BOT_MODEL,
                 max_tokens=2048,
-                system=system_prompt,
+                system=_claude_system_blocks(system_prompt),
                 messages=messages,
             )
             return _claude_text(resp)
@@ -382,7 +423,7 @@ def _call_ai_gemini(api_key: str, system_prompt: str, history: list, question: s
             response, _ = _generate_content_with_fallback(
                 client, contents,
                 types.GenerateContentConfig(
-                    system_instruction=system_prompt,
+                    system_instruction=_sys_str(system_prompt),
                     max_output_tokens=2048,
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
@@ -581,7 +622,7 @@ def _call_ai_with_calendar_claude(system_prompt, history, question,
             try:
                 resp = client.messages.create(
                     model=CUSTOMER_BOT_MODEL, max_tokens=2048,
-                    system=system_prompt, tools=tools, messages=messages,
+                    system=_claude_system_blocks(system_prompt), tools=tools, messages=messages,
                 )
                 last_err = None
                 break
@@ -678,7 +719,7 @@ def _call_ai_with_calendar_gemini(
         response, _model_used = _generate_content_with_fallback(
             client, contents,
             types.GenerateContentConfig(
-                system_instruction=system_prompt,
+                system_instruction=_sys_str(system_prompt),
                 tools=[tools],
                 max_output_tokens=2048,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
@@ -1312,7 +1353,9 @@ def generate_answer(
             # （電話/金額/薪資）擠出 history 後，模型在 DATA_SAVE 時憑空編造。
             _collected_block = _format_collected_block(session.get("collected_data"))
             if _collected_block:
-                system_prompt = system_prompt + _collected_block
+                # 已收集資料每輪會變 → 接在「變動段」後面，不破壞穩定段的快取
+                _stable, _volatile = _sys_parts(system_prompt)
+                system_prompt = (_stable, _volatile + _collected_block)
         else:
             session = None
             history = []
