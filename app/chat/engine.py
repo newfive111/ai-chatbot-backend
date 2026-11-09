@@ -348,7 +348,6 @@ def _call_ai_claude(system_prompt: str, history: list, question: str) -> str:
             resp = client.messages.create(
                 model=CUSTOMER_BOT_MODEL,
                 max_tokens=2048,
-                temperature=0.7,
                 system=system_prompt,
                 messages=messages,
             )
@@ -581,7 +580,7 @@ def _call_ai_with_calendar_claude(system_prompt, history, question,
         for _attempt in range(3):
             try:
                 resp = client.messages.create(
-                    model=CUSTOMER_BOT_MODEL, max_tokens=2048, temperature=0.7,
+                    model=CUSTOMER_BOT_MODEL, max_tokens=2048,
                     system=system_prompt, tools=tools, messages=messages,
                 )
                 last_err = None
