@@ -26,3 +26,7 @@ if not JWT_SECRET:
 # 平台管理的 Claude API Key（給後台設定助手「小懶」用；沒設就自動退回租客的 Gemini Key）
 PLATFORM_ANTHROPIC_KEY = os.getenv("PLATFORM_ANTHROPIC_KEY", "")
 ASSISTANT_CLAUDE_MODEL = os.getenv("ASSISTANT_CLAUDE_MODEL", "claude-sonnet-4-5")
+
+# 平台管理的 Gemini API Key，只用於知識庫 embedding（Claude 無 embedding API）。
+# 平台統一付費，租客不必再自備 Gemini Key；沒設就退回租客 Key、再退本地 hash 向量。
+PLATFORM_GEMINI_KEY = os.getenv("PLATFORM_GEMINI_KEY", "")

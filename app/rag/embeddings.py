@@ -40,13 +40,25 @@ def _local_embedding(text: str) -> List[float]:
     return [x / magnitude for x in vec]
 
 
-def get_embedding(text: str, api_key: str) -> List[float]:
-    """先嘗試 Gemini embedding API，失敗則用本地 hash 向量"""
+def get_embedding(text: str, api_key: str = "") -> List[float]:
+    """產生 embedding 向量。金鑰優先序：平台 Gemini Key → 租客 Key → 本地 hash 向量。
+
+    embedding 模型固定 text-embedding-005，換金鑰不改變向量空間，
+    所以平台金鑰與租客金鑰產出的向量可互通、不會污染既有知識庫檢索。
+    """
     import httpx
-    if api_key:
+    from app.config import PLATFORM_GEMINI_KEY
+    # 去重保序：平台金鑰先用（平台付費），再退回租客金鑰（相容舊 bot）
+    keys = [k for k in [PLATFORM_GEMINI_KEY, api_key] if k]
+    seen, candidates = set(), []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            candidates.append(k)
+    for key in candidates:
         for version, model in [("v1beta", "text-embedding-005"), ("v1beta", "text-embedding-004")]:
             try:
-                url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:embedContent?key={api_key}"
+                url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:embedContent?key={key}"
                 resp = httpx.post(url, json={"content": {"parts": [{"text": text}]}}, timeout=15)
                 if resp.is_success and "embedding" in resp.json():
                     return resp.json()["embedding"]["values"]

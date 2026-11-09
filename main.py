@@ -14,7 +14,7 @@ import httpx
 
 from app.rag.processor import extract_text_from_pdf, chunk_text
 from app.rag.embeddings import store_chunks, search_similar_chunks
-from app.chat.engine import generate_answer, reset_session, _generate_content_with_fallback
+from app.chat.engine import generate_answer, reset_session, _platform_claude_text, _platform_claude_json
 from app.line.webhook import verify_line_signature, reply_line_message, push_line_message, download_line_content
 from app.auth.utils import create_token, decode_token, generate_bot_id
 from app.config import (
@@ -899,45 +899,22 @@ _PERSONA_JSON_SPEC = """請只輸出一個 JSON 物件，不要有其他文字�
 
 
 def _ai_persona_form(api_key: str, instruction: str) -> dict:
-    """呼叫 Gemini 產出結構化角色填空 dict，並正規化 role / tones。"""
-    from google import genai
-    from google.genai import types
-    import time as _time
+    """用平台 Claude 產出結構化角色填空 dict，並正規化 role / tones。
 
-    client = genai.Client(api_key=api_key)
-    last_err = None
-    for attempt in range(3):
-        try:
-            response, _ = _generate_content_with_fallback(
-                client,
-                [types.Content(role="user", parts=[types.Part(text=instruction)])],
-                types.GenerateContentConfig(
-                    max_output_tokens=1200,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    response_mime_type="application/json",
-                ),
-            )
-            parts = response.candidates[0].content.parts if response.candidates else []
-            raw = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
-            data = json.loads(raw)
-            valid_roles = {"customer_service", "sales", "booking", "consultant", "general"}
-            valid_tones = {"親切", "專業", "簡潔", "熱情活潑", "正式禮貌", "幽默輕鬆"}
-            role = data.get("role") if data.get("role") in valid_roles else "customer_service"
-            tones = [t for t in (data.get("tones") or []) if t in valid_tones][:3] or ["親切"]
-            return {
-                "business":   str(data.get("business") or "").strip(),
-                "role":       role,
-                "tones":      tones,
-                "highlights": str(data.get("highlights") or "").strip(),
-                "taboos":     str(data.get("taboos") or "").strip(),
-            }
-        except Exception as e:
-            last_err = e
-            if "503" in str(e) or "overloaded" in str(e).lower():
-                _time.sleep(3 * (attempt + 1))
-            else:
-                raise
-    raise last_err
+    api_key 參數保留相容舊呼叫，實際改用平台 Claude（PLATFORM_ANTHROPIC_KEY）。
+    """
+    data = _platform_claude_json(instruction, max_tokens=1200)
+    valid_roles = {"customer_service", "sales", "booking", "consultant", "general"}
+    valid_tones = {"親切", "專業", "簡潔", "熱情活潑", "正式禮貌", "幽默輕鬆"}
+    role = data.get("role") if data.get("role") in valid_roles else "customer_service"
+    tones = [t for t in (data.get("tones") or []) if t in valid_tones][:3] or ["親切"]
+    return {
+        "business":   str(data.get("business") or "").strip(),
+        "role":       role,
+        "tones":      tones,
+        "highlights": str(data.get("highlights") or "").strip(),
+        "taboos":     str(data.get("taboos") or "").strip(),
+    }
 
 
 @app.post("/bots/{bot_id}/generate-persona")
@@ -957,8 +934,9 @@ async def generate_persona(
         raise HTTPException(404, "Bot 不存在")
     api_key  = bot_row.data[0].get("anthropic_api_key")
     bot_name = bot_row.data[0].get("name", "Bot")
-    if not api_key:
-        raise HTTPException(400, "請先設定 Gemini API Key")
+    from app.config import PLATFORM_ANTHROPIC_KEY
+    if not PLATFORM_ANTHROPIC_KEY:
+        raise HTTPException(400, "平台 AI 金鑰未設定，請聯絡客服")
 
     instruction = f"""用戶用一句話描述他的生意，請幫他規劃這個 AI 客服 Bot（名稱：「{bot_name}」）的角色設定。
 
@@ -981,8 +959,9 @@ async def extract_persona(bot_id: str, authorization: Optional[str] = Header(Non
     api_key  = bot_row.data[0].get("anthropic_api_key")
     bot_name = bot_row.data[0].get("name", "Bot")
     sp = (bot_row.data[0].get("system_prompt") or "").strip()
-    if not api_key:
-        raise HTTPException(400, "請先設定 Gemini API Key")
+    from app.config import PLATFORM_ANTHROPIC_KEY
+    if not PLATFORM_ANTHROPIC_KEY:
+        raise HTTPException(400, "平台 AI 金鑰未設定，請聯絡客服")
     if not sp:
         raise HTTPException(400, "這個 Bot 還沒有角色設定可以拆解")
 
@@ -1168,8 +1147,9 @@ async def upload_document(
     if not bot_row.data:
         raise HTTPException(404, "Bot 不存在")
     api_key = bot_row.data[0].get("anthropic_api_key", "")
-    if not api_key:
-        raise HTTPException(400, "請先在 Bot 設定中填入 Gemini API Key")
+    from app.config import PLATFORM_GEMINI_KEY
+    if not (PLATFORM_GEMINI_KEY or api_key):
+        raise HTTPException(400, "平台知識庫服務尚未設定，請聯絡客服")
 
     content = await file.read()
     if len(content) > MAX_UPLOAD_BYTES:
@@ -1200,8 +1180,9 @@ async def add_faq(
     if not bot_row.data:
         raise HTTPException(404, "Bot 不存在")
     api_key = bot_row.data[0].get("anthropic_api_key", "")
-    if not api_key:
-        raise HTTPException(400, "請先在 Bot 設定中填入 Gemini API Key")
+    from app.config import PLATFORM_GEMINI_KEY
+    if not (PLATFORM_GEMINI_KEY or api_key):
+        raise HTTPException(400, "平台知識庫服務尚未設定，請聯絡客服")
 
     chunks = chunk_text(body.content)
     try:
@@ -1670,9 +1651,12 @@ def _enqueue_line_text(bot: dict, bot_id: str, user_id: str, buf_key: str,
 
 async def _ingest_line_image(bot: dict, bot_id: str, user_id: str, buf_key: str,
                              message_id: str, reply_token: str, line_token: str):
-    """下載 LINE 圖片 → Gemini 讀圖 → 把辨識內容當文字塞進一般流程。失敗則提示客戶。"""
+    """下載 LINE 圖片 → AI 讀圖 → 把辨識內容當文字塞進一般流程。失敗則提示客戶。"""
     api_key = bot.get("anthropic_api_key")
-    if not api_key:
+    from app.chat.engine import CUSTOMER_BOT_PROVIDER
+    from app.config import PLATFORM_ANTHROPIC_KEY
+    _can_vision = bool(api_key) or (CUSTOMER_BOT_PROVIDER == "claude" and bool(PLATFORM_ANTHROPIC_KEY))
+    if not _can_vision:
         return
     try:
         img_bytes, mime = await download_line_content(message_id, access_token=line_token)
@@ -2643,8 +2627,9 @@ async def ai_analysis(
     api_key      = bot_row.data[0].get("anthropic_api_key")
     bot_name     = bot_row.data[0].get("name", "Bot")
     system_prompt = bot_row.data[0].get("system_prompt") or ""
-    if not api_key:
-        raise HTTPException(400, "請先設定 Gemini API Key")
+    from app.config import PLATFORM_ANTHROPIC_KEY
+    if not PLATFORM_ANTHROPIC_KEY:
+        raise HTTPException(400, "平台 AI 金鑰未設定，請聯絡客服")
 
     # 取對話，依 days 篩選時間範圍
     query = supabase.table("conversations")\
@@ -2757,40 +2742,16 @@ async def ai_analysis(
 只輸出報告本身，不要加前言或後記。"""
 
     try:
-        from google import genai
-        from google.genai import types
-        import time as _time
-
-        client = genai.Client(api_key=api_key)
-        last_err = None
-        for attempt in range(3):
-            try:
-                response, _ = _generate_content_with_fallback(
-                    client,
-                    [types.Content(role="user", parts=[types.Part(text=prompt)])],
-                    types.GenerateContentConfig(
-                        max_output_tokens=6000,
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    ),
-                )
-                parts = response.candidates[0].content.parts if response.candidates else []
-                report = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
-                return {
-                    "report": report.strip(),
-                    "stats": {
-                        "total_sessions":     total_sessions,
-                        "completed_sessions": completed_sessions,
-                        "completion_rate":    completion_rate,
-                        "total_messages":     len(convs),
-                    }
-                }
-            except Exception as e:
-                last_err = e
-                if "503" in str(e) or "overloaded" in str(e).lower():
-                    _time.sleep(3 * (attempt + 1))
-                else:
-                    raise
-        raise last_err
+        report = _platform_claude_text(prompt, max_tokens=6000)
+        return {
+            "report": report.strip(),
+            "stats": {
+                "total_sessions":     total_sessions,
+                "completed_sessions": completed_sessions,
+                "completion_rate":    completion_rate,
+                "total_messages":     len(convs),
+            }
+        }
     except Exception as e:
         raise HTTPException(500, f"AI 分析失敗：{str(e)[:200]}")
 
@@ -2810,8 +2771,9 @@ async def style_analysis(
     api_key       = bot_row.data[0].get("anthropic_api_key")
     bot_name      = bot_row.data[0].get("name", "Bot")
     system_prompt = bot_row.data[0].get("system_prompt") or ""
-    if not api_key:
-        raise HTTPException(400, "請先設定 Gemini API Key")
+    from app.config import PLATFORM_ANTHROPIC_KEY
+    if not PLATFORM_ANTHROPIC_KEY:
+        raise HTTPException(400, "平台 AI 金鑰未設定，請聯絡客服")
 
     query = supabase.table("conversations")\
         .select("question, answer, session_id, created_at")\
@@ -2908,39 +2870,15 @@ async def style_analysis(
 只輸出報告本身，不要前言後記。"""
 
     try:
-        from google import genai
-        from google.genai import types
-        import time as _time
-
-        client = genai.Client(api_key=api_key)
-        last_err = None
-        for attempt in range(3):
-            try:
-                response, _ = _generate_content_with_fallback(
-                    client,
-                    [types.Content(role="user", parts=[types.Part(text=prompt)])],
-                    types.GenerateContentConfig(
-                        max_output_tokens=6000,
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    ),
-                )
-                parts = response.candidates[0].content.parts if response.candidates else []
-                report = "".join(p.text for p in parts if hasattr(p, "text") and not getattr(p, "thought", False))
-                return {
-                    "report": report.strip(),
-                    "stats": {
-                        "total_sessions":    total_sessions,
-                        "human_reply_count": human_reply_count,
-                        "total_messages":    len(convs),
-                    }
-                }
-            except Exception as e:
-                last_err = e
-                if "503" in str(e) or "overloaded" in str(e).lower():
-                    _time.sleep(3 * (attempt + 1))
-                else:
-                    raise
-        raise last_err
+        report = _platform_claude_text(prompt, max_tokens=6000)
+        return {
+            "report": report.strip(),
+            "stats": {
+                "total_sessions":    total_sessions,
+                "human_reply_count": human_reply_count,
+                "total_messages":    len(convs),
+            }
+        }
     except Exception as e:
         raise HTTPException(500, f"語氣分析失敗：{str(e)[:200]}")
 

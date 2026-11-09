@@ -371,6 +371,55 @@ def _claude_system_blocks(system_prompt) -> list:
     return blocks
 
 
+def _platform_claude_text(prompt: str, *, max_tokens: int = 2048,
+                          system: Optional[str] = None) -> str:
+    """平台側一次性生成（對話摘要／角色填空／分析報告），用平台 Claude Haiku。
+
+    與客戶 bot 同一把 PLATFORM_ANTHROPIC_KEY、平台統一付費；不吃 temperature。
+    過載時重試三次，仍失敗則丟出例外交給呼叫端處理。
+    """
+    import time as _time
+    client = _claude_client()
+    last_err = None
+    for attempt in range(3):
+        try:
+            kwargs = dict(
+                model=CUSTOMER_BOT_MODEL,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            if system:
+                kwargs["system"] = system
+            resp = client.messages.create(**kwargs)
+            return _claude_text(resp)
+        except Exception as e:
+            last_err = e
+            es = str(e).lower()
+            if "overloaded" in es or "529" in es or "rate" in es or "503" in es:
+                _time.sleep(3 * (attempt + 1))
+            else:
+                raise
+    raise last_err
+
+
+def _platform_claude_json(prompt: str, *, max_tokens: int = 1500) -> dict:
+    """平台側一次性生成並解析成 JSON（Claude 無 response_mime_type，改用指示＋容錯解析）。"""
+    import json as _json
+    import re as _re
+    system = "你是嚴格的 JSON 產生器。只輸出一個合法 JSON 物件，不要加任何說明文字，也不要用 ``` 之類的 code fence。"
+    raw = _platform_claude_text(prompt, max_tokens=max_tokens, system=system).strip()
+    # 容錯：去掉可能的 code fence、擷取第一個 {...} 區塊
+    if raw.startswith("```"):
+        raw = _re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", raw).strip()
+    try:
+        return _json.loads(raw)
+    except Exception:
+        m = _re.search(r"\{.*\}", raw, _re.S)
+        if m:
+            return _json.loads(m.group(0))
+        raise
+
+
 def _call_ai(api_key: str, system_prompt: str, history: list, question: str) -> str:
     """客戶 bot 一般對話生成。依 CUSTOMER_BOT_PROVIDER 走 Claude 或 Gemini。"""
     if CUSTOMER_BOT_PROVIDER == "claude":
@@ -1247,12 +1296,11 @@ def _extract_and_save_data(
 
 
 def _generate_conversation_summary(api_key: str, history: list, last_question: str) -> str:
-    """用 AI 生成一句話對話摘要（30字以內）。失敗時回傳空字串。"""
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+    """用平台 Claude 生成一句話對話摘要（30字以內）。失敗時回傳空字串。
 
+    api_key 參數保留相容舊呼叫，實際改用平台 Claude（PLATFORM_ANTHROPIC_KEY）。
+    """
+    try:
         lines = []
         for m in (history or []):
             role = "客戶" if m.get("role") == "user" else "AI"
@@ -1265,8 +1313,7 @@ def _generate_conversation_summary(api_key: str, history: list, last_question: s
             "只輸出摘要本身，不要加任何前綴或標點說明：\n\n"
             f"{conversation_text}"
         )
-        response = model.generate_content(prompt)
-        return (response.text or "").strip()[:60]
+        return _platform_claude_text(prompt, max_tokens=120).strip()[:60]
     except Exception as e:
         logging.warning(f"[Engine] Summary generation failed: {e}")
         return ""
