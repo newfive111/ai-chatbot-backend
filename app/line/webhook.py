@@ -68,6 +68,30 @@ async def reply_line_message(reply_token: str, text: str, access_token: str = No
         return resp.status_code
 
 
+async def reply_line_messages(reply_token: str, messages: list, access_token: str = None) -> int:
+    """回覆多則訊息（可含 Flex）。messages 為 LINE message 物件陣列，最多 5 則。"""
+    token = access_token or LINE_CHANNEL_ACCESS_TOKEN
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"replyToken": reply_token, "messages": messages[:5]},
+        )
+        return resp.status_code
+
+
+async def push_line_messages(user_id: str, messages: list, access_token: str = None) -> int:
+    """主動推播多則訊息（可含 Flex），最多 5 則。"""
+    token = access_token or LINE_CHANNEL_ACCESS_TOKEN
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"to": user_id, "messages": messages[:5]},
+        )
+        return resp.status_code
+
+
 async def push_line_message(user_id: str, text: str, access_token: str = None, quick_replies: list = None) -> int:
     """主動推播訊息（不需要 reply token）"""
     token = access_token or LINE_CHANNEL_ACCESS_TOKEN

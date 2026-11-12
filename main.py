@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, HTMLResponse
 from pydantic import BaseModel
 from typing import Optional, Set, Dict
 from datetime import datetime, timedelta
@@ -15,7 +15,7 @@ import httpx
 from app.rag.processor import extract_text_from_pdf, chunk_text
 from app.rag.embeddings import store_chunks, search_similar_chunks
 from app.chat.engine import generate_answer, reset_session, _platform_claude_text, _platform_claude_json
-from app.line.webhook import verify_line_signature, reply_line_message, push_line_message, download_line_content
+from app.line.webhook import verify_line_signature, reply_line_message, push_line_message, download_line_content, reply_line_messages, push_line_messages, _build_quick_reply
 from app.auth.utils import create_token, decode_token, generate_bot_id
 from app.config import (
     SUPABASE_URL, SUPABASE_KEY,
@@ -1022,6 +1022,8 @@ class UpdateBotRequest(BaseModel):
     webhook_secret: Optional[str] = None
     webhook_enabled: Optional[bool] = None
     webhook_send_conversation: Optional[bool] = None   # 是否一併送出整段問答紀錄
+    # LIFF 快速填表（目前僅 697 使用）：開啟後歡迎語會附一張「快速填資料」Flex
+    liff_intake_enabled: Optional[bool] = None
 
 @app.patch("/bots/{bot_id}")
 async def update_bot(
@@ -1401,9 +1403,143 @@ def _get_bot_config(bot_id: str) -> dict:
         "name, anthropic_api_key, sheet_id, collect_fields, system_prompt, welcome_message, quick_replies, "
         "line_channel_secret, line_channel_access_token, "
         "calendar_id, slot_duration_minutes, business_hours, keyword_triggers, debounce_seconds, "
-        "instagram_page_token, instagram_account_id, facebook_page_id, off_hours_message, observe_mode, card_template"
+        "instagram_page_token, instagram_account_id, facebook_page_id, off_hours_message, observe_mode, card_template, "
+        "liff_intake_enabled"
     ).eq("id", bot_id).execute()
     return result.data[0] if result.data else {}
+
+
+def _intake_flex_or_none(bot: dict, bot_id: str, session_id: str):
+    """若此 bot 開了 LIFF 快速填表且平台已設 LIFF ID，回傳一張 Flex，否則 None。"""
+    from app.config import PLATFORM_LIFF_ID
+    if not (bot.get("liff_intake_enabled") and PLATFORM_LIFF_ID):
+        return None
+    try:
+        from app.line.liff import build_intake_flex
+        return build_intake_flex(bot_id, session_id, PLATFORM_LIFF_ID)
+    except Exception as e:
+        logging.warning(f"[LIFF] build flex failed bot={bot_id}: {e}")
+        return None
+
+
+def _welcome_messages(welcome: str, bot: dict, flex):
+    """組歡迎訊息陣列：純文字（帶 quick reply）＋可選的填表 Flex。"""
+    text_msg = {"type": "text", "text": welcome}
+    qr = _build_quick_reply(bot.get("quick_replies") or None)
+    if qr:
+        text_msg["quickReply"] = qr
+    return [text_msg] + ([flex] if flex else [])
+
+
+# ──────────────────────────────────────
+# LIFF 快速填表（目前僅 697 使用，靠 bots.liff_intake_enabled 開關）
+# ──────────────────────────────────────
+
+@app.get("/liff/intake")
+async def liff_intake_page():
+    """回傳 LIFF 表單頁（自包含 HTML）。LIFF ID 由後端注入。"""
+    from app.config import PLATFORM_LIFF_ID
+    from app.line.liff import render_intake_html
+    return HTMLResponse(render_intake_html(PLATFORM_LIFF_ID))
+
+
+class LiffIntakeBody(BaseModel):
+    sid: str
+    bot: str
+    data: dict
+    idToken: Optional[str] = None
+
+
+async def _verify_liff_id_token(id_token: str) -> bool:
+    """用 LINE 驗證 LIFF 的 idToken；未設 channel id 則略過驗證（回 True）。"""
+    from app.config import PLATFORM_LIFF_CHANNEL_ID
+    if not PLATFORM_LIFF_CHANNEL_ID:
+        return True
+    if not id_token:
+        return False
+    try:
+        async with httpx.AsyncClient() as hc:
+            r = await hc.post(
+                "https://api.line.me/oauth2/v2.1/verify",
+                data={"id_token": id_token, "client_id": PLATFORM_LIFF_CHANNEL_ID},
+                timeout=10,
+            )
+        return r.status_code == 200
+    except Exception as e:
+        logging.warning(f"[LIFF] idToken verify error: {e}")
+        return False
+
+
+@app.post("/liff/intake/submit")
+async def liff_intake_submit(body: LiffIntakeBody):
+    """收 LIFF 表單 → 合併進該 session 的 collected_data → 接回問答。"""
+    import re
+    bot_id = (body.bot or "").strip()
+    sid = (body.sid or "").strip()
+    prefix = f"line_{bot_id}_"
+    if not bot_id or not sid.startswith(prefix):
+        raise HTTPException(400, "參數有誤")
+
+    bot = _get_bot_config(bot_id)
+    if not bot:
+        raise HTTPException(404, "Bot 不存在")
+    if not bot.get("liff_intake_enabled"):
+        raise HTTPException(403, "此功能未開啟")
+
+    if not await _verify_liff_id_token(body.idToken or ""):
+        raise HTTPException(401, "身分驗證失敗，請重新開啟表單")
+
+    # 清理欄位：姓名/地區/需求金額取字串，電話驗 09xx
+    raw = body.data or {}
+    name = str(raw.get("姓名", "")).strip()
+    phone = re.sub(r"\D", "", str(raw.get("電話", "")))
+    area = str(raw.get("地區", "")).strip()
+    amount = str(raw.get("需求金額", "")).strip()
+    if not name or not re.fullmatch(r"09\d{8}", phone) or not area or not amount:
+        raise HTTPException(400, "欄位不完整或格式有誤")
+    clean = {"姓名": name, "電話": phone, "地區": area, "需求金額": amount}
+
+    from app.chat import session_store
+    from app.chat.engine import _merge_collected
+    session = session_store.get_or_create(sid)
+    if session.get("status") == "handed_off":
+        # 已結案，不重開；資料仍併入留存
+        session["collected_data"] = _merge_collected(session.get("collected_data"), clean)
+        session_store.save(sid, session)
+        return {"ok": True, "note": "already_done"}
+
+    session["collected_data"] = _merge_collected(session.get("collected_data"), clean)
+    session_store.save(sid, session)
+
+    # 接回問答：用一則合成的客戶訊息觸發 AI 接著問剩下的（工作/收入）→ 摘要 → 完成
+    user_id = sid[len(prefix):]
+    line_token = bot.get("line_channel_access_token")
+    try:
+        synthetic = (
+            f"我用表單填好基本資料了：姓名{name}、電話{phone}、地區{area}、需求金額{amount}。"
+            "接下來還需要提供什麼呢？"
+        )
+        answer = generate_answer(
+            bot_id, synthetic, bot.get("name", "AI 助理"),
+            api_key=bot.get("anthropic_api_key"),
+            collect_fields=(bot.get("collect_fields") or None),
+            sheet_id=bot.get("sheet_id"),
+            session_id=sid,
+            custom_system_prompt=bot.get("system_prompt") or None,
+            calendar_id=bot.get("calendar_id") or None,
+            slot_duration_minutes=bot.get("slot_duration_minutes") or 60,
+            business_hours=bot.get("business_hours") or None,
+            keyword_triggers=bot.get("keyword_triggers") or None,
+            off_hours_message=bot.get("off_hours_message") or None,
+            card_template=bot.get("card_template") or None,
+        )
+        if answer and line_token:
+            await push_line_message(user_id, answer, access_token=line_token)
+    except Exception as e:
+        # 接回問答失敗不影響資料已存；客戶下一句照常會續聊
+        logging.warning(f"[LIFF] continue after submit failed sid={sid[:16]}: {e}")
+
+    return {"ok": True}
 
 
 async def _process_line_buffer(bot_id: str, user_id: str, buf_key: str, debounce_seconds: int = 15):
@@ -1565,7 +1701,11 @@ async def line_webhook(bot_id: str, request: Request):
                 session_id = f"line_{bot_id}_{user_id}"
                 from app.chat.session_store import get_or_create
                 get_or_create(session_id)
-                await reply_line_message(reply_token, welcome, access_token=line_token, quick_replies=bot.get("quick_replies") or None)
+                flex = _intake_flex_or_none(bot, bot_id, session_id)
+                if flex:
+                    await reply_line_messages(reply_token, _welcome_messages(welcome, bot, flex), access_token=line_token)
+                else:
+                    await reply_line_message(reply_token, welcome, access_token=line_token, quick_replies=bot.get("quick_replies") or None)
             continue
 
         # ── 只處理 message 事件 ──
@@ -1610,7 +1750,11 @@ async def line_webhook(bot_id: str, request: Request):
             reset_session(session_id)
             remove_mute(bot_id, user_id)
             welcome = bot.get("welcome_message") or f"（記憶已重置）你好！我是{bot.get('name', 'AI 助理')}，有什麼可以幫您的嗎？😊"
-            await reply_line_message(reply_token, welcome, access_token=line_token, quick_replies=bot.get("quick_replies") or None)
+            flex = _intake_flex_or_none(bot, bot_id, session_id)
+            if flex:
+                await reply_line_messages(reply_token, _welcome_messages(welcome, bot, flex), access_token=line_token)
+            else:
+                await reply_line_message(reply_token, welcome, access_token=line_token, quick_replies=bot.get("quick_replies") or None)
             continue
 
         # 注意：靜音／觀察模式的訊息不在此攔截，改由 _process_line_buffer

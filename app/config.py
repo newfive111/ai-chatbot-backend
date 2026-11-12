@@ -30,3 +30,9 @@ ASSISTANT_CLAUDE_MODEL = os.getenv("ASSISTANT_CLAUDE_MODEL", "claude-sonnet-4-5"
 # 平台管理的 Gemini API Key，只用於知識庫 embedding（Claude 無 embedding API）。
 # 平台統一付費，租客不必再自備 Gemini Key；沒設就退回租客 Key、再退本地 hash 向量。
 PLATFORM_GEMINI_KEY = os.getenv("PLATFORM_GEMINI_KEY", "")
+
+# LIFF 快速填表（目前僅 697 使用，靠 bots.liff_intake_enabled 開關）。
+# PLATFORM_LIFF_ID：平台級 LIFF app 的 ID（所有要用的 bot 共用，靠網址帶 bot/sid 區分）。
+# PLATFORM_LIFF_CHANNEL_ID：該 LIFF 所屬 LINE Login channel 的 channel ID，用來驗證表單送回的 idToken；沒設則略過驗證。
+PLATFORM_LIFF_ID = os.getenv("PLATFORM_LIFF_ID", "")
+PLATFORM_LIFF_CHANNEL_ID = os.getenv("PLATFORM_LIFF_CHANNEL_ID", "")
