@@ -116,13 +116,8 @@ var $ = function(id){ return document.getElementById(id); };
 
 function showErr(m){ $("err").textContent = m || ""; }
 
-liff.init({ liffId: LIFF_ID }).then(function(){
-  if (liff.isLoggedIn()) {
-    liff.getProfile().then(function(p){
-      if (p && p.displayName && !$("f_name").value) $("f_name").value = p.displayName;
-    }).catch(function(){});
-  }
-}).catch(function(e){ showErr("載入失敗，請關掉重開：" + e); });
+// 不自動帶入 LINE 顯示名稱（常是綽號，697 要的是本名，留空讓客戶自己填）
+liff.init({ liffId: LIFF_ID }).catch(function(e){ showErr("載入失敗，請關掉重開：" + e); });
 
 $("submit").addEventListener("click", function(){
   var name = $("f_name").value.trim();
