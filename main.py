@@ -1495,9 +1495,12 @@ async def liff_intake_submit(body: LiffIntakeBody):
     phone = re.sub(r"\D", "", str(raw.get("電話", "")))
     area = str(raw.get("地區", "")).strip()
     amount = str(raw.get("需求金額", "")).strip()
+    line_id = str(raw.get("LINE ID", "")).strip()   # 選填：沒有可留空
     if not name or not re.fullmatch(r"09\d{8}", phone) or not area or not amount:
         raise HTTPException(400, "欄位不完整或格式有誤")
     clean = {"姓名": name, "電話": phone, "地區": area, "需求金額": amount}
+    if line_id:
+        clean["LINE ID"] = line_id
 
     from app.chat import session_store
     from app.chat.engine import _merge_collected
@@ -1515,8 +1518,9 @@ async def liff_intake_submit(body: LiffIntakeBody):
     user_id = sid[len(prefix):]
     line_token = bot.get("line_channel_access_token")
     try:
+        _line_part = f"、LINE ID {line_id}" if line_id else ""
         synthetic = (
-            f"我用表單填好基本資料了：姓名{name}、電話{phone}、地區{area}、需求金額{amount}。"
+            f"我用表單填好基本資料了：姓名{name}、電話{phone}、地區{area}、需求金額{amount}{_line_part}。"
             "接下來還需要提供什麼呢？"
         )
         answer = generate_answer(

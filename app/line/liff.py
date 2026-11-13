@@ -9,8 +9,9 @@ LIFF 快速填表（目前僅 697 這台 bot 使用，靠 bots.liff_intake_enabl
 """
 from urllib.parse import quote
 
-# 表單收集的必填欄位（鍵名務必對齊 697 prompt 的固定鍵名，卡片/webhook 才對得上）
-INTAKE_FIELDS = ["姓名", "電話", "地區", "需求金額"]
+# 表單收集的欄位（鍵名務必對齊 697 prompt 的固定鍵名，卡片/webhook 才對得上）。
+# 前四項必填，LINE ID 選填（很多人沒設，沒有就留空、靠手機聯繫）。
+INTAKE_FIELDS = ["姓名", "電話", "地區", "需求金額", "LINE ID"]
 
 
 def build_intake_flex(bot_id: str, session_id: str, liff_id: str) -> dict:
@@ -92,7 +93,11 @@ INTAKE_HTML = """<!doctype html>
     <div class="hint">縣市＋行政區即可，不用填完整門牌</div>
 
     <label>需求金額<span class="req"> *</span></label>
-    <input id="f_amount" type="text" inputmode="numeric" placeholder="例：10 萬">
+    <input id="f_amount" type="text" inputmode="numeric" placeholder="例：100000">
+    <div class="hint">直接填完整數字（元）</div>
+
+    <label>LINE ID<span style="color:#999;font-weight:400"> （沒有可留空）</span></label>
+    <input id="f_lineid" type="text" placeholder="有的話填，方便專員加您好友">
 
     <div class="err" id="err"></div>
     <button id="submit">送出</button>
@@ -124,6 +129,7 @@ $("submit").addEventListener("click", function(){
   var phone = $("f_phone").value.replace(/\\D/g, "");
   var area = $("f_area").value.trim();
   var amount = $("f_amount").value.trim();
+  var lineid = $("f_lineid").value.trim();
   if (!name) return showErr("請填姓名");
   if (!/^09\\d{8}$/.test(phone)) return showErr("手機格式怪怪的，請填 09 開頭共 10 碼");
   if (!area) return showErr("請填方便辦理的地區");
@@ -140,7 +146,7 @@ $("submit").addEventListener("click", function(){
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       sid: SID, bot: BOT, idToken: idToken,
-      data: { "姓名": name, "電話": phone, "地區": area, "需求金額": amount }
+      data: { "姓名": name, "電話": phone, "地區": area, "需求金額": amount, "LINE ID": lineid }
     })
   }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
     .then(function(res){
